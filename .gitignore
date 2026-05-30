@@ -1,12 +1,18 @@
+# Bytecode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Virtual env
 .venv/
+
+# Internal
 .reasonix/
 
+# Sensitive — never commit
 logs/
 results/
 cookies.json
 scheduler_state.json
+*.txt
