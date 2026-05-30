@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+.reasonix/
+
+logs/
+results/
+cookies.json
+scheduler_state.json
