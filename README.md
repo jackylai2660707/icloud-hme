@@ -1,10 +1,11 @@
-# iCloud HME Generator
+# iCloud HME — 多账号聚合管理平台
 
-基于 iCloud Hide My Email 协议，自动批量创建 `@icloud.com` 隐私邮箱的工具。
+基于 iCloud Hide My Email 协议，批量创建 `@icloud.com` 隐私邮箱的商用聚合平台。
 
-- ⏱ 定时调度 — 每小时随机触发，触达上限自动停止，等下一轮
-- 🌐 Web UI — 白色简洁面板，仪表盘 + 日志 + 邮箱列表
-- 📡 联网校时 — HTTP 对时，不怕服务器时钟漂移
+- 👥 **多账号管理** — 同时管理多组 iCloud 账号，每个独立存储、独立会话
+- 🔗 **账号-别名映射** — 自动提取真实 Apple ID，每个隐私邮箱标注归属账号
+- ⏱ **定时调度** — 整点自动触发，多账号轮询创建，触达上限自动切下一个
+- 🌐 **Web UI** — 暖色面板，仪表盘 + 账号列表 + 别名管理 + 跨账号批量创建
 
 ## 前提条件
 
@@ -18,15 +19,12 @@
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 获取 cookie
-#    用 Chrome 打开 https://www.icloud.com/settings/ 并登录
-#    安装 Cookie Editor 扩展 → Export → Header String
+# 2. 启动 Web UI
+python web_ui.py
 
-# 3. 启动 Web UI + 调度器
-python web_ui.py --scheduler
-
-# 4. 打开 http://127.0.0.1:5050
-#    点击左侧「导入 Cookie」粘贴 Header String
+# 3. 打开 http://127.0.0.1:5050
+#    点击左下角「导入 Cookie」添加第一个账号
+#    支持粘贴 Cookie Editor 的 Header String 或 JSON
 ```
 
 ## 使用方式
@@ -34,83 +32,86 @@ python web_ui.py --scheduler
 ### Web UI（推荐）
 
 ```bash
-python web_ui.py --scheduler          # 启动 Web + 自动调度
-python web_ui.py --port 8080          # 指定端口
-python web_ui.py --cookies cookies.json  # 从文件加载 cookie
+python web_ui.py                    # 启动 Web 界面
+python web_ui.py --port 8080        # 指定端口
+python web_ui.py --scheduler        # 启动时自动开启调度器
 ```
 
-打开浏览器访问 `http://127.0.0.1:5050`，界面提供：
+界面功能：
 
-- 仪表盘：累计/今日/本轮统计 + 下次触发倒计时
-- 手动创建：一次一个或批量
-- 调度器：启停控制，状态实时显示
-- 邮箱列表：一键复制 / 全部复制 / CSV 导出
+| 模块 | 功能 |
+|------|------|
+| **账号管理** | 添加/切换/删除账号，每个账号独立 Cookie + 会话 |
+| **仪表盘** | 账号总数、总别名数、今日创建数，每账号一张状态卡片 |
+| **别名列表** | 实时拉取所有别名，标注所属账号 + 真实邮箱 |
+| **批量创建** | 勾选目标账号 → 输入数量 → 跨账号轮询创建 |
+| **调度器** | 一键启停，每整点遍历所有活跃账号创建到上限 |
 
-### CLI 独立调度器
+### 命令行调度器
 
 ```bash
-python scheduler.py --cookies cookies.json
-```
+# 多账号定时调度（需要先通过 Web UI 添加账号）
+python scheduler.py
 
-纯命令行，无 Web 界面，适合服务器挂机。
+# 指定账号间间隔
+python scheduler.py --interval 5
+
+# 后台守护进程
+python scheduler.py -d
+```
 
 ### CLI 手动操作
 
 ```bash
-# 创建 1 个
-python icloud_hme.py create
-
-# 批量创建 5 个
-python icloud_hme.py create -n 5 -o results.json
-
 # 列出所有别名
-python icloud_hme.py list
+python icloud_hme.py list --cookies cookies.json
 
-# 删除指定别名
-python icloud_hme.py delete --email xxx@icloud.com
+# 创建别名
+python icloud_hme.py create -n 5 --cookies cookies.json
 
-# 导出 Chrome cookie 到文件
-python icloud_hme.py export-cookies -o cookies.json
+# 删除别名
+python icloud_hme.py delete --email xxx@icloud.com --cookies cookies.json
 ```
 
 ## Cookie 获取
 
-三种方式任选：
-
 | 方式 | 说明 |
 |------|------|
-| Chrome 自动提取 | Windows 下自动从 Chrome 读 cookie（需登录过 icloud.com） |
-| Cookie Editor Header String | 粘贴到 Web UI 导入框，自动保存 |
-| 命令行 `--cookies` | 指定 JSON 或 Header String 文件 |
+| Web UI 导入 | 点击左下角按钮，粘贴 Cookie Editor 的 Header String |
+| Chrome 自动提取 | Windows 下 `python icloud_hme.py export-cookies` |
+| 命令行 `--cookies` | 指定 JSON 文件路径 |
 
-导入一次后自动存盘 `cookies.json`，重启不再需要重新粘贴。
+支持两种输入格式：
+- **Header String**：`name1=value1; name2=value2; ...`
+- **JSON**：`{"name1":"value1", "name2":"value2"}`
+
+导入后自动持久化到 `accounts.json`，重启无需重新粘贴。
 
 ## 调度逻辑
 
 ```
-每个整点的 前15分钟或后15分钟 随机选一刻触发
-  → 创建到 iCloud 返回上限为止
-  → 等待下一个随机触发时刻
-  → 连续两轮都因上限失败 → 延迟 5 分 23 秒重试
-  → 任意两轮间隔 ≥ 45 分钟
+每整点触发一轮
+  → 遍历所有活跃账号
+  → 每个账号创建到 iCloud 返回上限
+  → 账号间间隔 3 秒（可配）
+  → 全部完成后等待下一个整点
 ```
-
-时间基于联网校准（HTTP Date 头），不依赖本地时钟。
 
 ## 文件结构
 
 ```
-├── icloud_hme.py       # 核心库：cookie 提取 / HME API / 别名操作
-├── web_ui.py           # Flask Web 面板 + 内置调度器
-├── scheduler.py        # 独立命令行调度器
-└── requirements.txt    # pip 依赖
+├── icloud_hme.py        # 核心库：Cookie 提取 / HME API / 账号身份提取
+├── account_manager.py   # 多账号管理器：CRUD / 批量创建 / 别名索引
+├── web_ui.py            # Flask Web 面板 + 内置调度器
+├── scheduler.py         # 独立命令行调度器
+└── requirements.txt     # pip 依赖
 ```
 
-运行时生成的文件（已 gitignore）：
+运行时生成：
 
 ```
-cookies.json           # 导入的 cookie（自动持久化）
-scheduler_state.json   # 调度器状态
+accounts.json          # 所有账号及 Cookie（自动持久化）
+scheduler_state.json   # 调度器历史状态
 logs/                  # 运行日志
 results/               # 创建的邮箱列表
 ```
@@ -123,12 +124,6 @@ pycryptodome>=3.15     # Chrome cookie 解密 (Windows)
 pywin32>=305           # Windows DPAPI (仅 Windows)
 flask>=3.0             # Web UI
 ```
-
-## 交流
-
-灌水 QQ 群：**1060714372**
-
-友情链接：[LINUX DO](https://linux.do/)
 
 ## License
 

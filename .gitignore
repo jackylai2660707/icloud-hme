@@ -10,9 +10,16 @@ __pycache__/
 # Internal
 .reasonix/
 
+# Backups
+backup/
+
 # Sensitive — never commit
 logs/
 results/
 cookies.json
+cookies.json.bak
+icloud_cookies.json
+accounts.json
 scheduler_state.json
 latest_emails.txt
+mail_cache.json
