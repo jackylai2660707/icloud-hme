@@ -43,6 +43,8 @@ class AccountManager:
         self.accounts: Dict[str, Dict] = {}
         self._lock = threading.Lock()
         self._cache = get_cache()
+        self._mail_pool: Dict[str, Any] = {}   # acc_id -> ICloudMail (reusable)
+        self._pool_lock = threading.Lock()
         self._load()
 
     def _load(self):
@@ -332,7 +334,36 @@ class AccountManager:
                 "未设置 App 专用密码。\n"
                 "请点击下方按钮，输入 @icloud.com 邮箱和应用密码"
             )
-        return ICloudMail(imap_email, app_pwd, verbose=verbose)
+
+        # Try to reuse a pooled connection
+        with self._pool_lock:
+            cached = self._mail_pool.get(acc_id)
+            if cached:
+                try:
+                    # NOOP to verify the connection is still alive
+                    if cached._conn and cached._conn.noop()[0] == "OK":
+                        return cached
+                except Exception:
+                    # Connection is dead, remove it
+                    try:
+                        cached.disconnect()
+                    except Exception:
+                        pass
+                    del self._mail_pool[acc_id]
+
+        # Create a fresh connection and pool it
+        client = ICloudMail(imap_email, app_pwd, verbose=verbose)
+        client.connect()
+        with self._pool_lock:
+            # Close any old stale entry before replacing
+            old = self._mail_pool.get(acc_id)
+            if old:
+                try:
+                    old.disconnect()
+                except Exception:
+                    pass
+            self._mail_pool[acc_id] = client
+        return client
 
     def check_inbox(self, acc_id: str, limit: int = 50, days: int = 7,
                     force: bool = False) -> List[Dict]:
@@ -345,7 +376,6 @@ class AccountManager:
         try:
             mail = self.get_mail_client(acc_id)
             new_msgs = mail.check_inbox(limit=50, days=days)
-            mail.disconnect()
         except Exception:
             new_msgs = []
 
@@ -366,7 +396,6 @@ class AccountManager:
         try:
             mail = self.get_mail_client(acc_id)
             new_msgs = mail.find_by_recipient(alias_email, limit=20, days=days)
-            mail.disconnect()
         except Exception:
             new_msgs = []
 
@@ -402,7 +431,6 @@ class AccountManager:
         try:
             mail = self.get_mail_client(acc_id)
             all_inbox = mail.check_inbox(limit=100, days=days)
-            mail.disconnect()
         except Exception:
             return cached if cached else {}
 
@@ -426,7 +454,6 @@ class AccountManager:
         try:
             mail = self.get_mail_client(acc_id)
             result = mail.test_connection()
-            mail.disconnect()
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}

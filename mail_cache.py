@@ -21,7 +21,7 @@ class MailCache:
     """邮件本地缓存"""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._data: Dict = {}
         self._load()
 
@@ -57,7 +57,13 @@ class MailCache:
         with self._lock:
             self._ensure_account(acc_id)
             existing_ids = {e.get("id") for e in self._data[acc_id]["inbox_emails"]}
-            new_emails = [e for e in emails if e.get("id") not in existing_ids]
+            seen_ids = set()
+            new_emails = []
+            for e in emails:
+                eid = e.get("id")
+                if eid not in existing_ids and eid not in seen_ids:
+                    new_emails.append(e)
+                    seen_ids.add(eid)
             if new_emails:
                 self._data[acc_id]["inbox_emails"].extend(new_emails)
                 if len(self._data[acc_id]["inbox_emails"]) > 500:
@@ -77,7 +83,13 @@ class MailCache:
             if alias_email not in self._data[acc_id]["alias_emails"]:
                 self._data[acc_id]["alias_emails"][alias_email] = []
             existing_ids = {e.get("id") for e in self._data[acc_id]["alias_emails"][alias_email]}
-            new_emails = [e for e in emails if e.get("id") not in existing_ids]
+            seen_ids = set()
+            new_emails = []
+            for e in emails:
+                eid = e.get("id")
+                if eid not in existing_ids and eid not in seen_ids:
+                    new_emails.append(e)
+                    seen_ids.add(eid)
             if new_emails:
                 self._data[acc_id]["alias_emails"][alias_email].extend(new_emails)
             self._save()
@@ -89,7 +101,13 @@ class MailCache:
                 if alias not in self._data[acc_id]["alias_emails"]:
                     self._data[acc_id]["alias_emails"][alias] = []
                 existing_ids = {e.get("id") for e in self._data[acc_id]["alias_emails"][alias]}
-                new_emails = [e for e in emails if e.get("id") not in existing_ids]
+                seen_ids = set()
+                new_emails = []
+                for e in emails:
+                    eid = e.get("id")
+                    if eid not in existing_ids and eid not in seen_ids:
+                        new_emails.append(e)
+                        seen_ids.add(eid)
                 if new_emails:
                     self._data[acc_id]["alias_emails"][alias].extend(new_emails)
             self._save()
