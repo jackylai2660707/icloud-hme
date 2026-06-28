@@ -1,0 +1,9 @@
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+model_instructions_file = "./prompts/instruction.md"
+
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+
+[windows]
+sandbox = "elevated"
