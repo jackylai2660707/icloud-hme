@@ -47,6 +47,15 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 
+def _safe_error_text(text: str, limit: int = 200) -> str:
+    """返回适合日志/UI 展示的错误文本，避免泄露 Apple trust/session token。"""
+    text = text or ""
+    if "trustTokens" in text:
+        return "iCloud 要求重新建立信任态 (trustTokens)。请重新登录 iCloud 并重新导入 Cookie。"
+    text = re.sub(r'("X-APPLE-[^"]*"\s*:\s*")([^"]+)(")', r'\1[REDACTED]\3', text)
+    text = re.sub(r'(HSARMTKNSRV)[A-Za-z0-9+/=_-]+', r'\1[REDACTED]', text)
+    return text[:limit]
+
 # ============================================================
 # 常量
 # ============================================================
@@ -282,7 +291,11 @@ class ICloudHME:
             try:
                 resp = self.session.request(method, full_url, headers=headers, data=body, timeout=timeout)
                 if not resp.ok:
-                    last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                    err_text = _safe_error_text(resp.text)
+                    if resp.status_code == 421 and "trustTokens" in (resp.text or ""):
+                        last_err = RuntimeError(f"HTTP 421: {err_text}")
+                        raise last_err
+                    last_err = RuntimeError(f"HTTP {resp.status_code}: {err_text}")
                     if resp.status_code in (401, 403):
                         raise last_err
                     if attempt < max_attempts:
@@ -360,6 +373,89 @@ class ICloudHME:
         self._log(f"共 {len(aliases)} 个别名")
         return aliases
 
+    def get_forward_options(self) -> Dict[str, Any]:
+        """读取 Apple 账号已绑定/允许的 Hide My Email 转发邮箱。
+
+        v2/hme/list 的 result 中通常包含:
+          - forwardToEmails: 可选择的转发邮箱列表
+          - selectedForwardTo: Apple 当前默认转发邮箱
+        """
+        self._resolve_service()
+        self._log("获取转发地址选项...")
+        response = self._request("GET", f"{self._service_url}/v2/hme/list")
+        emails: List[str] = []
+        selected = ""
+
+        if isinstance(response, dict):
+            result = response.get("result", {})
+            if isinstance(result, dict):
+                raw_emails = (
+                    result.get("forwardToEmails")
+                    or result.get("forwardToEmailAddresses")
+                    or result.get("recipientEmails")
+                    or []
+                )
+                if isinstance(raw_emails, list):
+                    for item in raw_emails:
+                        email = ""
+                        if isinstance(item, str):
+                            email = item
+                        elif isinstance(item, dict):
+                            email = (
+                                item.get("email")
+                                or item.get("address")
+                                or item.get("forwardToEmail")
+                                or item.get("recipientMailId")
+                                or ""
+                            )
+                        email = self._normalize_email_value(email)
+                        if email and email not in emails:
+                            emails.append(email)
+
+                selected = self._normalize_email_value(
+                    result.get("selectedForwardTo")
+                    or result.get("selectedForwardToEmail")
+                    or result.get("defaultForwardToEmail")
+                    or result.get("forwardToEmail")
+                    or ""
+                )
+
+        # 兼容字段缺失的响应：从已有别名的 forwardToEmail 里兜底提取。
+        if not emails:
+            for alias in self._parse_alias_list(response):
+                email = self._normalize_email_value(alias.get("forwardToEmail", ""))
+                if email and email not in emails:
+                    emails.append(email)
+
+        if selected and selected not in emails:
+            emails.insert(0, selected)
+
+        self._log(f"可选转发地址 {len(emails)} 个")
+        return {"emails": emails, "selected": selected}
+
+    def update_forward_to(self, forward_to: str) -> Dict[str, Any]:
+        """更新 Apple Hide My Email 的默认转发邮箱。
+
+        注意：Apple 端要求该地址必须已绑定到当前 Apple ID，并且出现在
+        ``v2/hme/list`` 返回的 ``forwardToEmails`` 中。
+        """
+        self._resolve_service()
+        forward_to = self._normalize_email_value(forward_to)
+        if not forward_to:
+            raise ValueError("转发地址无效")
+
+        self._log(f"更新转发地址为 {forward_to} ...")
+        response = self._request(
+            "POST",
+            f"{self._service_url}/v1/hme/updateForwardTo",
+            json_data={"forwardToEmail": forward_to},
+            max_attempts=2,
+        )
+        if not response.get("success"):
+            err = response.get("error", {})
+            raise RuntimeError(f"更新转发地址失败: {err.get('errorMessage', 'unknown')}")
+        return {"ok": True, "forward_to_email": forward_to}
+
     def generate(self) -> str:
         """生成候选别名 (未保留)"""
         self._resolve_service()
@@ -374,13 +470,17 @@ class ICloudHME:
         self._log(f"候选: {hme}")
         return hme
 
-    def reserve(self, hme: str, label: Optional[str] = None) -> str:
+    def reserve(self, hme: str, label: Optional[str] = None, forward_to: Optional[str] = None) -> str:
         """保留/确认候选别名"""
         self._resolve_service()
         if not label:
             label = f"Created {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         self._log(f"保留别名 {hme} ...")
         data = {"hme": hme, "label": label, "note": "Created by icloud_hme tool"}
+        if forward_to:
+            # iCloud HME v2/list 返回每个别名字段 forwardToEmail；
+            # reserve 时带上该字段，让新别名尽量使用指定转发地址。
+            data["forwardToEmail"] = forward_to
         response = self._request("POST", f"{self._service_url}/v1/hme/reserve", json_data=data, max_attempts=2)
         if not response.get("success"):
             err = response.get("error", {})
@@ -390,7 +490,7 @@ class ICloudHME:
         self._log(f"已保留: {alias}")
         return alias
 
-    def create_alias(self, label: Optional[str] = None, max_retries: int = 5) -> Dict:
+    def create_alias(self, label: Optional[str] = None, max_retries: int = 5, forward_to: Optional[str] = None) -> Dict:
         """生成 + 保留，一步创建。返回 {'email': ..., 'label': ...}"""
         last_err = ""
         for attempt in range(max_retries):
@@ -408,8 +508,8 @@ class ICloudHME:
                     continue
                 break
             try:
-                email = self.reserve(hme, label)
-                return {"email": email, "label": label or "", "created_at": datetime.now().isoformat()}
+                email = self.reserve(hme, label, forward_to=forward_to)
+                return {"email": email, "label": label or "", "created_at": datetime.now().isoformat(), "forward_to": forward_to or ""}
             except Exception as e:
                 last_err = str(e)
                 self._log(f"reserve 失败: {last_err}")
@@ -439,6 +539,13 @@ class ICloudHME:
         return True
 
     # ---- 解析 ----
+
+    @staticmethod
+    def _normalize_email_value(value: Any) -> str:
+        value = str(value or "").strip().lower()
+        if "@" not in value or any(ch.isspace() for ch in value):
+            return ""
+        return value
 
     @staticmethod
     def _parse_alias_list(response: Any) -> List[Dict]:
@@ -482,6 +589,7 @@ class ICloudHME:
                 "email": email,
                 "anonymousId": str(item.get("anonymousId") or item.get("id") or ""),
                 "label": str(item.get("label") or item.get("metaData", {}).get("label") or ""),
+                "forwardToEmail": str(item.get("forwardToEmail") or item.get("recipientMailId") or ""),
                 "active": item.get("active", True) and item.get("isActive", True)
                 and state not in ("inactive", "deleted"),
                 "createdAt": item.get("createTimestamp") or item.get("createdAt"),

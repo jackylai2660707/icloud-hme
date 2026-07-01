@@ -1,0 +1,6 @@
+name = "icloud-hme-mail-inbound"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+[vars]
+INBOUND_URL = "https://icloud.armsg.yueseng-ys.com/api/inbound-mail"

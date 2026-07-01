@@ -21,5 +21,12 @@ cookies.json.bak
 icloud_cookies.json
 accounts.json
 scheduler_state.json
+scheduler_config.json
+app_settings.json
+inbound_config.json
 latest_emails.txt
 mail_cache.json
+.deploy-secrets
+.env
+
+cf_compat_config.json

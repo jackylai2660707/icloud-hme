@@ -41,7 +41,7 @@ class AccountManager:
 
     def __init__(self):
         self.accounts: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._cache = get_cache()
         self._mail_pool: Dict[str, Any] = {}   # acc_id -> ICloudMail (reusable)
         self._pool_lock = threading.Lock()
@@ -188,6 +188,56 @@ class AccountManager:
         self._save()
         return account
 
+    def update_account_cookies(
+        self, acc_id: str, cookie_input: str, name: Optional[str] = None, host: Optional[str] = None
+    ) -> Dict:
+        """重新导入指定账号 Cookie，并立即校验会话/同步别名数量。
+
+        校验失败时仍保存新 Cookie，账号状态标记为 error，方便用户看到错误并再次更新。
+        """
+        from icloud_hme import ICloudHME
+
+        cookies = self.parse_cookie_input(cookie_input)
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+
+        if name is not None and str(name).strip():
+            account["name"] = str(name).strip()
+        if host is not None and str(host).strip():
+            account["host"] = str(host).strip()
+        account["cookies"] = cookies
+        account["status"] = "active"
+        account["last_error"] = None
+
+        try:
+            client = ICloudHME(cookies, host=account.get("host", "icloud.com"), verbose=False)
+            client.validate_session()
+            info = client.get_account_info()
+            if info:
+                account["real_email"] = (
+                    info.get("appleId", "")
+                    or info.get("primaryEmail", "")
+                )
+                account["icloud_email"] = self._derive_icloud_email(info)
+            try:
+                aliases = client.list_aliases()
+                account["alias_total"] = len(aliases)
+                account["alias_active"] = sum(
+                    1 for a in aliases if a.get("active")
+                )
+            except Exception:
+                pass
+            account["last_validated"] = datetime.now().isoformat()
+            account["last_error"] = None
+            account["status"] = "active"
+        except Exception as e:
+            account["status"] = "error"
+            account["last_error"] = str(e)[:300]
+
+        self._save()
+        return account
+
     def remove_account(self, acc_id: str) -> bool:
         if acc_id in self.accounts:
             del self.accounts[acc_id]
@@ -301,6 +351,128 @@ class AccountManager:
             host=account.get("host", "icloud.com"),
             verbose=verbose,
         )
+
+    def get_forward_options(self) -> Dict[str, Any]:
+        """聚合所有 Apple 账号里已绑定/允许的 HME 转发邮箱。
+
+        返回结构:
+          {
+            "emails": ["a@example.com", ...],
+            "selected": "apple 当前默认邮箱",
+            "accounts": [
+              {"account_id": "...", "emails": [...], "selected": "...", "ok": true}
+            ]
+          }
+        """
+        emails: List[str] = []
+        seen = set()
+        selected = ""
+        per_accounts: List[Dict[str, Any]] = []
+
+        for acc_id, account in self.accounts.items():
+            if not account.get("cookies"):
+                continue
+            item: Dict[str, Any] = {
+                "account_id": acc_id,
+                "account_name": account.get("name", ""),
+                "account_email": account.get("real_email", ""),
+                "status": account.get("status", ""),
+                "emails": [],
+                "selected": "",
+                "ok": False,
+            }
+            try:
+                client = self.get_client(acc_id, verbose=False)
+                data = client.get_forward_options()
+                account_emails = [
+                    str(e).strip().lower()
+                    for e in data.get("emails", [])
+                    if str(e).strip() and "@" in str(e)
+                ]
+                account_selected = str(data.get("selected") or "").strip().lower()
+                item["emails"] = account_emails
+                item["selected"] = account_selected
+                item["ok"] = True
+
+                if account_selected and not selected:
+                    selected = account_selected
+                for email in account_emails:
+                    if email not in seen:
+                        seen.add(email)
+                        emails.append(email)
+            except Exception as e:
+                item["error"] = str(e)[:200]
+            per_accounts.append(item)
+
+        if selected and selected not in seen:
+            emails.insert(0, selected)
+
+        return {
+            "emails": emails,
+            "selected": selected,
+            "accounts": per_accounts,
+        }
+
+    def update_forward_to(self, forward_to: str) -> Dict[str, Any]:
+        """把所有可用 Apple 账号的 Hide My Email 转发地址切到指定邮箱。"""
+        forward_to = str(forward_to or "").strip().lower()
+        if not forward_to or "@" not in forward_to:
+            raise ValueError("转发地址无效")
+
+        results: List[Dict[str, Any]] = []
+        ok_accounts = 0
+        failed_accounts = 0
+
+        for acc_id, account in self.accounts.items():
+            if not account.get("cookies"):
+                continue
+            item: Dict[str, Any] = {
+                "account_id": acc_id,
+                "account_name": account.get("name", ""),
+                "account_email": account.get("real_email", ""),
+                "ok": False,
+            }
+            try:
+                client = self.get_client(acc_id, verbose=False)
+                options = client.get_forward_options()
+                allowed = [
+                    str(e).strip().lower()
+                    for e in options.get("emails", [])
+                    if str(e).strip()
+                ]
+                if allowed and forward_to not in allowed:
+                    raise ValueError("该邮箱不在 Apple 账号可选转发地址中")
+
+                before = str(options.get("selected") or "").strip().lower()
+                client.update_forward_to(forward_to)
+                after = str(client.get_forward_options().get("selected") or "").strip().lower()
+                item.update({
+                    "ok": after == forward_to,
+                    "before": before,
+                    "after": after,
+                })
+                if item["ok"]:
+                    ok_accounts += 1
+                    account["last_error"] = None
+                else:
+                    failed_accounts += 1
+                    item["error"] = "Apple 返回成功，但读取后的默认转发地址未变化"
+            except Exception as e:
+                failed_accounts += 1
+                item["error"] = str(e)[:200]
+                account["last_error"] = str(e)[:300]
+            results.append(item)
+
+        if results:
+            self._save()
+
+        return {
+            "ok": failed_accounts == 0 and ok_accounts > 0,
+            "forward_to_email": forward_to,
+            "ok_accounts": ok_accounts,
+            "failed_accounts": failed_accounts,
+            "accounts": results,
+        }
 
     def set_app_password(self, acc_id: str, app_password: str):
         with self._lock:
@@ -459,7 +631,7 @@ class AccountManager:
             return {"ok": False, "error": str(e)[:200]}
 
     def create_aliases_for_account(
-        self, acc_id: str, count: int = 1, label: str = ""
+        self, acc_id: str, count: int = 1, label: str = "", forward_to: str = ""
     ) -> List[Dict]:
         from icloud_hme import ICloudHME
 
@@ -480,13 +652,14 @@ class AccountManager:
                     f"{account.get('name', acc_id)} "
                     f"{datetime.now().strftime('%m%d%H%M')}-{i + 1}"
                 )
-                result = client.create_alias(label=alias_label, max_retries=3)
+                result = client.create_alias(label=alias_label, max_retries=3, forward_to=forward_to or None)
                 email = result.get("email", "")
                 if email:
                     results.append({
                         "email": email,
                         "account_id": acc_id,
                         "ok": True,
+                        "forward_to": forward_to or "",
                     })
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:
@@ -502,13 +675,16 @@ class AccountManager:
                     })
             except Exception as e:
                 err_str = str(e)
+                lower = err_str.lower()
+                if any(kw in lower for kw in ("http 401", "http 403", "http 421", "trusttokens", "cookie", "session")):
+                    account["status"] = "error"
+                    account["last_error"] = err_str[:300]
                 results.append({
                     "email": None,
                     "account_id": acc_id,
                     "ok": False,
                     "error": err_str[:200],
                 })
-                lower = err_str.lower()
                 if any(kw in lower for kw in (
                     "limit", "exceeded", "maximum", "quota", "429",
                     "too many", "rate", "throttle",
@@ -524,6 +700,7 @@ class AccountManager:
         count_per_account: int = 1,
         interval_sec: float = 3.0,
         label: str = "",
+        forward_to: str = "",
     ) -> Dict[str, List[Dict]]:
         all_results: Dict[str, List[Dict]] = {}
         for i, acc_id in enumerate(account_ids):
@@ -541,7 +718,7 @@ class AccountManager:
                 continue
 
             results = self.create_aliases_for_account(
-                acc_id, count_per_account, label
+                acc_id, count_per_account, label, forward_to=forward_to
             )
             all_results[acc_id] = results
 

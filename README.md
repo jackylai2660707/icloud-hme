@@ -45,7 +45,22 @@ python web_ui.py --scheduler        # 启动时自动开启调度器
 | **仪表盘** | 账号总数、总别名数、今日创建数，每账号一张状态卡片 |
 | **别名列表** | 实时拉取所有别名，标注所属账号 + 真实邮箱 |
 | **批量创建** | 勾选目标账号 → 输入数量 → 跨账号轮询创建 |
-| **调度器** | 一键启停，每整点遍历所有活跃账号创建到上限 |
+| **调度器** | 支持两种模式：随机窗口模式；固定间隔模式（如每 30 分钟创建 1 个） |
+| **全局邮箱设置** | 可开启隐私邮箱加号派生（如 `name+1@icloud.com` ~ `name+4@icloud.com`），并设置新建别名尝试使用的转发地址 |
+
+计划任务说明：
+
+- **随机窗口模式**：北京时间 `7:00-20:00` 运行，轮次间隔 `60-90` 分钟，每轮每账号随机创建 `3-5` 个
+- **固定间隔模式**：按你设置的分钟数循环触发，例如“每 `30` 分钟创建 `1` 个”
+- 固定间隔模式会在**所有活跃账号之间轮询**，避免长期只打一个账号
+- 计划任务配置会持久化到本地 `scheduler_config.json`
+
+加号派生说明：
+
+- 开启后，本地列表 / 复制 / CSV 会把每个实际创建的隐私邮箱额外展示为 `+1` ~ `+N` 变体
+- 例如实际创建 `name@icloud.com`，展示为 `name@icloud.com`、`name+1@icloud.com`、`name+2@icloud.com` ...
+- 这些派生地址不额外调用 Apple 创建接口，不消耗 Hide My Email 创建额度
+- 转发地址留空时使用 iCloud 当前默认转发地址；填写时会在新建别名时尝试传给 Apple HME API
 
 ### 命令行调度器
 
@@ -112,9 +127,175 @@ python icloud_hme.py delete --email xxx@icloud.com --cookies cookies.json
 ```
 accounts.json          # 所有账号及 Cookie（自动持久化）
 scheduler_state.json   # 调度器历史状态
+scheduler_config.json  # Web UI 调度器配置
+app_settings.json      # Web UI 全局邮箱设置（派生开关、转发地址）
+inbound_config.json    # Cloudflare Email Worker 入站投递 token
 logs/                  # 运行日志
-results/               # 创建的邮箱列表
+results/               # 创建的邮箱列表、本机收件箱 SQLite 数据库
 ```
+
+## 本机收件箱 / 分享分发
+
+现在可以不用 Apple IMAP 查收邮件，而是让 Apple Hide My Email 把邮件转发到你自己域名的邮箱，再由 Cloudflare Email Routing Worker 投递回本机。
+
+推荐链路：
+
+```
+外部发件人
+  → xxx@icloud.com 隐私邮箱
+  → Apple HME 转发到已绑定邮箱，例如 inbox@mail.armsg.yueseng-ys.com
+  → Cloudflare Email Routing Worker
+  → POST https://icloud.armsg.yueseng-ys.com/api/inbound-mail
+  → 本机 SQLite 保存
+  → Web UI「本机收件箱」按隐私邮箱独立展示和分享
+```
+
+配置步骤：
+
+1. 在 Apple 账号里添加并验证 `inbox@mail.armsg.yueseng-ys.com` 或你的 catch-all 邮箱。
+2. 回到 Web UI「全局邮箱设置」，刷新并选择该转发地址。
+3. 打开 Web UI「本机收件箱」→「Worker 配置」，复制：
+   - `INBOUND_URL`
+   - `INBOUND_TOKEN`
+   - Worker 模板地址
+4. 在 Cloudflare 创建 Email Worker，代码可用：
+   - `https://icloud.armsg.yueseng-ys.com/cloudflare_inbound_worker.js`
+5. 在 Worker 变量里设置：
+   - `INBOUND_URL=https://icloud.armsg.yueseng-ys.com/api/inbound-mail`
+   - `INBOUND_TOKEN=Web UI 中显示的 token`
+6. 在 Cloudflare Email Routing 里把目标地址或 catch-all 路由到该 Worker。
+
+相关接口：
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/inbound-mail` | Cloudflare Worker 投递原始邮件，Bearer token 认证 |
+| `GET /api/local-inbox/summary` | 按隐私邮箱统计本机收到的邮件 |
+| `GET /api/local-inbox/messages?alias=xxx@icloud.com` | 查看某个隐私邮箱的独立收件箱 |
+| `POST /api/local-inbox/share` | 给隐私邮箱分配负责人并生成只读分享链接 |
+| `GET /share/{token}` | 外部分发人员只读收件箱页面 |
+
+外层 Caddy 不再启用 Basic Auth，统一改为应用内入口鉴权：`/admin` 用管理员密码登录，`/user` 用地址凭证或用户账号登录，分享链接安全边界仍是高强度随机 token。
+
+「本机收件箱」会合并当前已创建/已云端同步的历史隐私邮箱和派生地址，即使收件数为 0，也可以提前分配负责人并生成分享链接。
+
+## Cloudflare Temp Email 兼容模式
+
+项目现在增加了一个兼容 `dreamhunter2333/cloudflare_temp_email` 使用习惯的登录和 API 层。区别只有一个：邮箱地址不是 Cloudflare 自定义域随机生成，而是通过 iCloud Hide My Email 创建 / 同步得到。
+
+### 页面入口
+
+| 页面 | 说明 |
+|------|------|
+| `/admin` | 管理员登录入口。登录后进入原 iCloud HME 管理界面：账号、调度器、隐私邮箱、本机收件箱、凭证导出 |
+| `/user` | 普通用户收件入口。支持“地址凭证 JWT 登录”和“用户账号登录 + 绑定地址凭证” |
+| `/share/{token}` | 单个隐私邮箱的只读分享收件箱 |
+
+管理员密码由应用内配置控制。为了兼容 cftempmail 前端，`/open_api/admin_login` 同时接受明文密码或前端 SHA-256 后的密码。
+
+### 地址凭证 / JWT
+
+管理员在「隐私邮箱列表」点击「导出凭证」即可导出 CSV，字段包括：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 本机地址 ID |
+| `name` | iCloud 隐私邮箱地址 |
+| `jwt` / `credential` | 地址凭证，兼容 cftempmail 的 Address JWT 用法 |
+| `account_id` | 归属 iCloud 账号 |
+| `mail_count` | 本机收件数量 |
+
+普通用户拿到某个地址的 `jwt` 后，可以：
+
+1. 直接在 `/user` 的「凭证登录」里查看这个地址的收件箱；
+2. 注册 / 登录用户账号后，把该 `jwt` 绑定到个人账号，之后一个账号可管理多个隐私邮箱。
+
+### cftempmail 兼容 API
+
+#### Open API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/open_api/settings` | 站点公开配置，字段兼容 cftempmail |
+| `POST` | `/open_api/admin_login` | 管理员登录，Body: `{"password":"<明文或sha256>"}` |
+| `POST` | `/open_api/credential_login` | 地址凭证校验，Body: `{"credential":"<Address JWT>"}` |
+
+#### 地址 JWT API
+
+这些接口使用 `Authorization: Bearer <Address JWT>`：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/settings` | 当前地址信息：`{ address, address_id, send_balance }` |
+| `GET` | `/api/mails?limit=&offset=` | 当前地址邮件列表，返回 raw MIME |
+| `GET` | `/api/mail/{id}` | 当前地址单封 raw 邮件 |
+| `GET` | `/api/parsed_mails?limit=&offset=` | 当前地址解析后的邮件列表 |
+| `GET` | `/api/parsed_mail/{id}` | 当前地址单封解析邮件 |
+| `DELETE` | `/api/clear_inbox` | 清空当前地址本机收件箱 |
+| `DELETE` | `/api/delete_address` | 删除本机地址凭证 / 绑定记录；不会删除 Apple HME 里的真实隐私邮箱 |
+
+示例：
+
+```bash
+BASE=https://icloud.armsg.yueseng-ys.com
+JWT='<导出的地址凭证>'
+
+curl -s "$BASE/api/settings" \
+  -H "Authorization: Bearer $JWT"
+
+curl -s "$BASE/api/parsed_mails?limit=20&offset=0" \
+  -H "Authorization: Bearer $JWT"
+```
+
+#### 用户 API
+
+用户接口使用 `x-user-token: <用户JWT>`；绑定地址时额外传 `Authorization: Bearer <Address JWT>`。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/user_api/register` | 注册用户，Body: `{"email":"u@example.com","password":"<明文或sha256>"}` |
+| `POST` | `/user_api/login` | 登录用户，返回 `{ jwt }` |
+| `GET` | `/user_api/settings` | 当前用户信息 |
+| `GET` | `/user_api/bind_address` | 用户已绑定地址列表 |
+| `POST` | `/user_api/bind_address` | 绑定地址凭证到当前用户 |
+| `GET` | `/user_api/bind_address_jwt/{address_id}` | 取回已绑定地址的 Address JWT |
+| `GET` | `/user_api/mails?address=&limit=&offset=` | 查看用户所有 / 指定地址邮件 |
+
+示例：
+
+```bash
+BASE=https://icloud.armsg.yueseng-ys.com
+
+USER_JWT=$(curl -s -X POST "$BASE/user_api/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@example.com","password":"password"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["jwt"])')
+
+curl -s -X POST "$BASE/user_api/bind_address" \
+  -H "x-user-token: $USER_JWT" \
+  -H "Authorization: Bearer <Address JWT>"
+
+curl -s "$BASE/user_api/mails?limit=20&offset=0" \
+  -H "x-user-token: $USER_JWT"
+```
+
+#### 管理员 API
+
+管理员接口兼容 cftempmail 的 `x-admin-auth`。可以传管理员密码明文或 SHA-256；也可以先登录 `/admin` 后使用浏览器 cookie。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/admin/address?limit=&offset=&query=` | 地址列表 |
+| `POST` | `/admin/new_address` | 创建新的 iCloud HME 隐私邮箱，返回 Address JWT |
+| `GET` | `/admin/show_password/{address_id}` | 查看某个地址的 Address JWT |
+| `GET` | `/admin/export_credentials.csv` | 导出全部地址凭证 CSV |
+| `GET` | `/admin/export_credentials` | 导出全部地址凭证 JSON |
+| `GET` | `/admin/mails?address=&limit=&offset=` | 管理员查看全部 / 指定地址邮件 |
+| `DELETE` | `/admin/mails/{id}` | 删除本机邮件 |
+| `GET` | `/admin/users` | 用户列表 |
+| `POST` | `/admin/users` | 创建用户 |
+| `DELETE` | `/admin/users/{id}` | 删除用户 |
+
+注意：`/admin/new_address` 会真实调用 Apple HME 创建隐私邮箱，仍受 Apple 限额影响；失败后请等待下一周期，不要高频重试。
 
 ## 依赖
 

@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading
+import sys, os, json, time, queue, secrets, threading, base64, csv, io, sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
-from flask import Flask, Response, request, jsonify, render_template_string
+from flask import Flask, Response, request, jsonify, render_template_string, redirect, make_response
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
+from inbound_mail import InboundMailStore
+from cf_compat import CfCompatStore, normalize_password_secret, norm_email
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
 LOGS_DIR = HERE / "logs"
+SCHEDULER_CONFIG_FILE = HERE / "scheduler_config.json"
+APP_SETTINGS_FILE = HERE / "app_settings.json"
+CLOUD_ALIASES_CACHE_FILE = RESULTS_DIR / "cloud_aliases_cache.json"
+INBOUND_CONFIG_FILE = HERE / "inbound_config.json"
+INBOUND_DB_FILE = RESULTS_DIR / "inbound_mail.db"
+CF_COMPAT_CONFIG_FILE = HERE / "cf_compat_config.json"
+DEPLOY_SECRETS_FILE = HERE / ".deploy-secrets"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -26,11 +35,19 @@ _history_lock = threading.Lock()
 _log_counter = 0
 _counter_lock = threading.Lock()
 _today_key = datetime.now().strftime("%Y%m%d")
-_global_state = {"running":False,"creating":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0}
+_global_state = {"running":False,"creating":False,"stopping":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0,"scheduler_mode":"window_random","scheduler_interval_minutes":60,"scheduler_count_per_run":1,"scheduler_account_interval_sec":3.0,"scheduler_label_prefix":"","scheduler_selected_accounts":[],"alias_split_enabled":False,"alias_split_count":4,"forward_to_email":""}
 _lock = threading.Lock()
+_config_lock = threading.Lock()
+_settings_lock = threading.Lock()
 _scheduler_thread = None
 _stop_event = threading.Event()
 _account_mgr = AccountManager()
+_inbound_store = InboundMailStore(INBOUND_DB_FILE)
+_cf_store = CfCompatStore(INBOUND_DB_FILE, CF_COMPAT_CONFIG_FILE, DEPLOY_SECRETS_FILE)
+_scheduler_config = {}
+_scheduler_runtime = {"rr_index":0}
+_app_settings = {}
+_inbound_config = {}
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -83,52 +100,698 @@ def _increment_state(**kw):
         if today != _today_key: _global_state["today_created"] = 0; _today_key = today
         for k, delta in kw.items(): _global_state[k] = _global_state.get(k,0) + delta
 
-def _scheduler_loop():
+def _default_app_settings() -> dict:
+    return {
+        "alias_split_enabled": False,
+        "alias_split_count": 4,
+        "forward_to_email": "",
+    }
+
+def _sanitize_email(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if "@" not in value or any(ch.isspace() for ch in value):
+        raise ValueError("转发地址格式不正确")
+    return value.lower()
+
+def _sanitize_app_settings(raw) -> dict:
+    cfg = _default_app_settings()
+    if not isinstance(raw, dict):
+        return cfg
+    cfg["alias_split_enabled"] = bool(raw.get("alias_split_enabled", cfg["alias_split_enabled"]))
+    try:
+        cfg["alias_split_count"] = max(1, min(int(float(raw.get("alias_split_count", cfg["alias_split_count"]))), 20))
+    except Exception:
+        pass
+    cfg["forward_to_email"] = _sanitize_email(raw.get("forward_to_email", cfg["forward_to_email"]))
+    return cfg
+
+def _load_app_settings() -> dict:
+    if APP_SETTINGS_FILE.exists():
+        try:
+            return _sanitize_app_settings(json.loads(APP_SETTINGS_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return _default_app_settings()
+
+def _save_app_settings(cfg: dict):
+    APP_SETTINGS_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _get_app_settings() -> dict:
+    with _settings_lock:
+        return dict(_app_settings)
+
+def _sync_app_state(cfg: dict = None):
+    cfg = cfg or _get_app_settings()
+    _update_state(
+        alias_split_enabled=cfg.get("alias_split_enabled", False),
+        alias_split_count=cfg.get("alias_split_count", 4),
+        forward_to_email=cfg.get("forward_to_email", ""),
+    )
+
+def _set_app_settings(raw, persist: bool = True) -> dict:
+    cfg = _sanitize_app_settings(raw)
+    with _settings_lock:
+        _app_settings.clear()
+        _app_settings.update(cfg)
+    if persist:
+        _save_app_settings(cfg)
+    _sync_app_state(cfg)
+    return cfg
+
+def _email_plus_variant(email: str, index: int) -> str:
+    local, domain = str(email).rsplit("@", 1)
+    return f"{local}+{index}@{domain}"
+
+def _expand_email_records(records: list, settings: dict = None) -> list:
+    settings = settings or _get_app_settings()
+    if not settings.get("alias_split_enabled"):
+        return records
+    count = int(settings.get("alias_split_count", 4) or 4)
+    expanded = []
+    for rec in records:
+        expanded.append(rec)
+        email = rec.get("email", "")
+        if "@" not in email:
+            continue
+        for i in range(1, count + 1):
+            v = dict(rec)
+            v["email"] = _email_plus_variant(email, i)
+            v["base_email"] = email
+            v["variant_index"] = i
+            v["derived"] = True
+            expanded.append(v)
+    return expanded
+
+def _email_record_key(rec: dict):
+    return (
+        str(rec.get("account_id", "") or "").strip(),
+        str(rec.get("email", "") or "").strip().lower(),
+    )
+
+def _dedupe_email_records(records: list) -> list:
+    """按账号+邮箱去重；云端同步记录优先补全标签、状态、anonymousId 等信息。"""
+    order = []
+    merged = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        email = str(rec.get("email", "") or "").strip().lower()
+        if "@" not in email:
+            continue
+        item = dict(rec)
+        item["email"] = email
+        key = _email_record_key(item)
+        if key not in merged:
+            order.append(key)
+            merged[key] = item
+            continue
+        old = merged[key]
+        # local 记录保留创建顺序；cloud 记录用于补全实时元数据。
+        if item.get("source") == "cloud":
+            new = dict(old)
+            for k, v in item.items():
+                if v not in (None, "") or k in ("active", "derived"):
+                    new[k] = v
+            merged[key] = new
+        else:
+            for k, v in item.items():
+                if k not in old or old.get(k) in (None, ""):
+                    old[k] = v
+    return [merged[k] for k in order]
+
+def _read_local_email_records(limit: int = 0) -> list:
+    records = []
+    f = RESULTS_DIR / "latest_emails.txt"
+    if f.exists():
+        lines = f.read_text(encoding="utf-8").strip().split("\n")
+        if limit > 0 and len(lines) > limit:
+            lines = lines[-limit:]
+        for line in lines:
+            line = line.strip()
+            if line and "@" in line:
+                parts = line.split("\t")
+                records.append({
+                    "email": parts[0],
+                    "account_id": parts[1] if len(parts) > 1 else "",
+                    "created_at": "",
+                    "derived": False,
+                    "source": "local",
+                })
+    records.reverse()
+    return records
+
+def _load_cached_cloud_aliases() -> list:
+    if not CLOUD_ALIASES_CACHE_FILE.exists():
+        return []
+    try:
+        raw = json.loads(CLOUD_ALIASES_CACHE_FILE.read_text(encoding="utf-8"))
+        aliases = raw.get("aliases", []) if isinstance(raw, dict) else raw
+        return aliases if isinstance(aliases, list) else []
+    except Exception:
+        return []
+
+def _save_cached_cloud_aliases(aliases: list):
+    CLOUD_ALIASES_CACHE_FILE.write_text(
+        json.dumps({
+            "updated_at": _now().isoformat(),
+            "aliases": aliases,
+        }, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+def _sync_cloud_alias_cache() -> list:
+    aliases = []
+    for alias in _account_mgr.get_all_aliases():
+        item = dict(alias)
+        item["source"] = "cloud"
+        item["derived"] = False
+        item["created_at"] = item.get("created_at") or item.get("createdAt") or ""
+        aliases.append(item)
+    aliases = _dedupe_email_records(aliases)
+    _save_cached_cloud_aliases(aliases)
+    return aliases
+
+def _load_inbound_config() -> dict:
+    cfg = {"token": "", "public_base_url": ""}
+    if INBOUND_CONFIG_FILE.exists():
+        try:
+            raw = json.loads(INBOUND_CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update({k: str(v or "") for k, v in raw.items()})
+        except Exception:
+            pass
+    if not cfg.get("token"):
+        cfg["token"] = secrets.token_urlsafe(32)
+        _save_inbound_config(cfg)
+    return cfg
+
+def _save_inbound_config(cfg: dict):
+    INBOUND_CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _get_inbound_config() -> dict:
+    return dict(_inbound_config)
+
+def _regenerate_inbound_token() -> dict:
+    _inbound_config["token"] = secrets.token_urlsafe(32)
+    _save_inbound_config(_inbound_config)
+    return _get_inbound_config()
+
+def _share_base_url() -> str:
+    cfg = _get_inbound_config()
+    base = (cfg.get("public_base_url") or "").strip().rstrip("/")
+    if base:
+        return base
+    try:
+        proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "https"
+        host = request.headers.get("X-Forwarded-Host") or request.host
+        if host:
+            if proto == "http" and not (host.startswith("127.0.0.1") or host.startswith("localhost")):
+                proto = "https"
+            return f"{proto}://{host}".rstrip("/")
+        return request.url_root.rstrip("/")
+    except Exception:
+        return "https://icloud.armsg.yueseng-ys.com"
+
+def _known_alias_records_for_inbound() -> list:
+    records = _dedupe_email_records(_read_local_email_records() + _load_cached_cloud_aliases())
+    return _dedupe_email_records(_expand_email_records(records))
+
+def _known_aliases_and_account_map():
+    records = _known_alias_records_for_inbound()
+    aliases = []
+    account_map = {}
+    for r in records:
+        email = str(r.get("email", "") or "").strip().lower()
+        if email and "@" in email:
+            aliases.append(email)
+            if r.get("account_id"):
+                account_map[email] = r.get("account_id")
+    return aliases, account_map
+
+def _check_inbound_auth() -> bool:
+    token = (_get_inbound_config().get("token") or "").strip()
+    auth = request.headers.get("Authorization", "")
+    supplied = ""
+    if auth.lower().startswith("bearer "):
+        supplied = auth.split(" ", 1)[1].strip()
+    elif request.headers.get("X-Inbound-Token"):
+        supplied = request.headers.get("X-Inbound-Token", "").strip()
+    return bool(token and supplied and secrets.compare_digest(token, supplied))
+
+def _read_deploy_secret(key: str) -> str:
+    try:
+        for line in DEPLOY_SECRETS_FILE.read_text(encoding="utf-8").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                return v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+def _basic_auth_ok() -> bool:
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("basic "):
+        return False
+    try:
+        raw = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8", "replace")
+        user, pwd = raw.split(":", 1)
+    except Exception:
+        return False
+    expected_user = _read_deploy_secret("BASIC_AUTH_USER")
+    expected_pwd = _read_deploy_secret("BASIC_AUTH_PASS")
+    return bool(
+        expected_user and expected_pwd
+        and secrets.compare_digest(user, expected_user)
+        and secrets.compare_digest(pwd, expected_pwd)
+    )
+
+def _admin_auth_ok() -> bool:
+    if _basic_auth_ok():
+        return True
+    candidates = [
+        request.headers.get("x-admin-auth", ""),
+        request.cookies.get("cf_admin_auth", ""),
+    ]
+    for value in candidates:
+        if value and _cf_store.verify_admin_secret(value):
+            return True
+    return False
+
+def _maybe_set_admin_cookie(resp):
+    if _basic_auth_ok() and not request.cookies.get("cf_admin_auth"):
+        deploy_pass = _read_deploy_secret("BASIC_AUTH_PASS")
+        if deploy_pass:
+            resp.set_cookie(
+                "cf_admin_auth",
+                normalize_password_secret(deploy_pass),
+                max_age=30*24*3600,
+                httponly=False,
+                secure=True,
+                samesite="Lax",
+            )
+    return resp
+
+def _has_bearer_token() -> bool:
+    return request.headers.get("Authorization", "").lower().startswith("bearer ")
+
+def _get_bearer_token() -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+def _address_payload_or_none():
+    token = _get_bearer_token()
+    if not token:
+        return None
+    try:
+        return _cf_store.verify_address_token(token)
+    except Exception:
+        return None
+
+def _user_payload_or_none():
+    token = request.headers.get("x-user-token", "") or request.cookies.get("cf_user_token", "")
+    if not token:
+        return None
+    try:
+        return _cf_store.verify_user_token(token)
+    except Exception:
+        return None
+
+def _sync_cf_addresses() -> int:
+    records = _known_alias_records_for_inbound()
+    n = _cf_store.sync_addresses(records)
+    # 兜底把已经收到过邮件但不在当前云端缓存里的地址也加入凭证表。
+    extra = []
+    for row in _inbound_store.list_aliases():
+        if row.get("alias"):
+            extra.append({"email": row.get("alias"), "account_id": row.get("account_id", ""), "source": "inbound"})
+    if extra:
+        n += _cf_store.sync_addresses(extra)
+    return n
+
+def _cf_mail_row(msg: dict, include_raw: bool = True, parsed: bool = False) -> dict:
+    row = {
+        "id": msg.get("id"),
+        "address": msg.get("hme_alias") or msg.get("address") or "",
+        "message_id": msg.get("message_id") or "",
+        "from": msg.get("from") or msg.get("source_from") or msg.get("sender_name") or "",
+        "sender": msg.get("sender_name") or msg.get("from") or msg.get("source_from") or "",
+        "subject": msg.get("subject") or "(无主题)",
+        "created_at": msg.get("created_at") or "",
+        "updated_at": msg.get("created_at") or "",
+    }
+    if include_raw:
+        row["raw"] = msg.get("raw") or ""
+        row["source"] = msg.get("raw") or ""
+    if parsed:
+        row["text"] = msg.get("text") or ""
+        row["html"] = msg.get("html") or ""
+        row["attachments"] = []
+    return row
+
+def _list_cf_mails(addresses: list, limit: int = 50, offset: int = 0, include_raw: bool = True, parsed: bool = False):
+    addresses = [norm_email(a) for a in addresses if norm_email(a)]
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    if not addresses:
+        return {"results": [], "count": 0, "limit": limit, "offset": offset}
+    # 直接读 inbound_mail.db，避免 list_messages 对单个 alias 的限制。
+    placeholders = ",".join("?" for _ in addresses)
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM inbound_mails WHERE hme_alias IN ({placeholders})",
+            addresses,
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"""
+            SELECT id, message_id, source_from, source_from AS "from", envelope_to,
+                   hme_alias, base_alias, account_id, subject, sender_name,
+                   text, html, raw, created_at
+            FROM inbound_mails
+            WHERE hme_alias IN ({placeholders})
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            addresses + [limit, offset],
+        ).fetchall()
+    return {
+        "results": [_cf_mail_row(dict(r), include_raw=include_raw, parsed=parsed) for r in rows],
+        "count": count,
+        "limit": limit,
+        "offset": offset,
+    }
+
+def _get_cf_mail(mail_id: int, addresses: list, include_raw: bool = True, parsed: bool = False):
+    addresses = [norm_email(a) for a in addresses if norm_email(a)]
+    if not addresses:
+        return None
+    placeholders = ",".join("?" for _ in addresses)
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, message_id, source_from, source_from AS "from", envelope_to,
+                   hme_alias, base_alias, account_id, subject, sender_name,
+                   text, html, raw, headers_json, created_at
+            FROM inbound_mails
+            WHERE id=? AND hme_alias IN ({placeholders})
+            """,
+            [int(mail_id)] + addresses,
+        ).fetchone()
+    return _cf_mail_row(dict(row), include_raw=include_raw, parsed=parsed) if row else None
+
+def _list_all_cf_mails(limit: int = 50, offset: int = 0, include_raw: bool = True, parsed: bool = False):
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM inbound_mails").fetchone()["c"]
+        rows = conn.execute(
+            """
+            SELECT id, message_id, source_from, source_from AS "from", envelope_to,
+                   hme_alias, base_alias, account_id, subject, sender_name,
+                   text, html, raw, created_at
+            FROM inbound_mails
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [limit, offset],
+        ).fetchall()
+    return {
+        "results": [_cf_mail_row(dict(r), include_raw=include_raw, parsed=parsed) for r in rows],
+        "count": count,
+        "limit": limit,
+        "offset": offset,
+    }
+
+def _json_error(message: str, status: int = 401):
+    return jsonify({"success": False, "error": message}), status
+
+def _path_is_cf_address_api(path: str) -> bool:
+    exact = {"/api/settings", "/api/mails", "/api/parsed_mails", "/api/delete_address", "/api/clear_inbox", "/api/clear_sent_items", "/api/address_login"}
+    return path in exact or path.startswith("/api/mail/") or path.startswith("/api/parsed_mail/")
+
+def _path_is_public(path: str) -> bool:
+    if path in ("/admin", "/user", "/login", "/logout", "/favicon.ico", "/cloudflare_inbound_worker.js"):
+        return True
+    return (
+        path.startswith("/open_api/")
+        or path.startswith("/user_api/")
+        or path.startswith("/share/")
+        or path.startswith("/api/shared/")
+        or path == "/api/inbound-mail"
+    )
+
+@app.before_request
+def _app_auth_gate():
+    path = request.path
+    if _path_is_public(path):
+        return None
+    if path.startswith("/admin/"):
+        if _admin_auth_ok():
+            return None
+        return _json_error("NeedAdminPasswordMsg", 401)
+    if _path_is_cf_address_api(path):
+        if _address_payload_or_none() or _admin_auth_ok():
+            return None
+        return _json_error("InvalidAddressCredentialMsg", 401)
+    # 这些创建接口兼容 cftempmail，但本项目默认要求管理员或已登录用户。
+    if path == "/api/new_address":
+        if _admin_auth_ok() or _user_payload_or_none():
+            return None
+        return _json_error("NewAddressAnonymousDisabledMsg", 403)
+    # 其余 /api 和主界面都是管理员能力。Caddy Basic 仍可用；如果未来放开 Caddy，
+    # 这里会用 app 内 admin cookie/header 兜底保护。
+    if path == "/" or path == "/index.html" or path.startswith("/api/"):
+        if _admin_auth_ok():
+            return None
+        if path == "/" or path == "/index.html":
+            return redirect("/admin")
+        return _json_error("NeedAdminPasswordMsg", 401)
+    return None
+
+_inbound_config.update(_load_inbound_config())
+
+def _default_scheduler_config() -> dict:
+    return {
+        "mode": "window_random",
+        "interval_minutes": 60,
+        "count_per_run": 1,
+        "account_interval_sec": 3.0,
+        "label_prefix": "",
+        "selected_accounts": [],
+    }
+
+def _sanitize_scheduler_config(raw) -> dict:
+    cfg = _default_scheduler_config()
+    if not isinstance(raw, dict):
+        return cfg
+    mode = str(raw.get("mode", cfg["mode"])).strip().lower()
+    cfg["mode"] = mode if mode in ("window_random", "interval") else cfg["mode"]
+    try: cfg["interval_minutes"] = max(1, min(int(float(raw.get("interval_minutes", cfg["interval_minutes"]))), 1440))
+    except Exception: pass
+    try: cfg["count_per_run"] = max(1, min(int(float(raw.get("count_per_run", cfg["count_per_run"]))), 20))
+    except Exception: pass
+    try: cfg["account_interval_sec"] = max(0.0, min(float(raw.get("account_interval_sec", cfg["account_interval_sec"])), 600.0))
+    except Exception: pass
+    cfg["label_prefix"] = str(raw.get("label_prefix", cfg["label_prefix"])).strip()[:80]
+    valid_ids = set(_account_mgr.accounts.keys())
+    selected_accounts = raw.get("selected_accounts", [])
+    if isinstance(selected_accounts, list):
+        seen = set()
+        picked = []
+        for acc_id in selected_accounts:
+            acc_id = str(acc_id).strip()
+            if acc_id and acc_id in valid_ids and acc_id not in seen:
+                picked.append(acc_id); seen.add(acc_id)
+        cfg["selected_accounts"] = picked
+    return cfg
+
+def _load_scheduler_config() -> dict:
+    if SCHEDULER_CONFIG_FILE.exists():
+        try:
+            return _sanitize_scheduler_config(json.loads(SCHEDULER_CONFIG_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return _default_scheduler_config()
+
+def _save_scheduler_config(cfg: dict):
+    SCHEDULER_CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _get_scheduler_config() -> dict:
+    with _config_lock:
+        return dict(_scheduler_config)
+
+def _sync_scheduler_state(cfg: dict = None):
+    cfg = cfg or _get_scheduler_config()
+    _update_state(
+        scheduler_mode=cfg.get("mode", "window_random"),
+        scheduler_interval_minutes=cfg.get("interval_minutes", 60),
+        scheduler_count_per_run=cfg.get("count_per_run", 1),
+        scheduler_account_interval_sec=cfg.get("account_interval_sec", 3.0),
+        scheduler_label_prefix=cfg.get("label_prefix", ""),
+        scheduler_selected_accounts=cfg.get("selected_accounts", []),
+    )
+
+def _set_scheduler_config(raw, persist: bool = True) -> dict:
+    cfg = _sanitize_scheduler_config(raw)
+    with _config_lock:
+        _scheduler_config.clear()
+        _scheduler_config.update(cfg)
+    if persist:
+        _save_scheduler_config(cfg)
+    _sync_scheduler_state(cfg)
+    return cfg
+
+def _get_scheduler_accounts(cfg: dict = None):
+    cfg = cfg or _get_scheduler_config()
+    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    selected_ids = cfg.get("selected_accounts") or []
+    if not selected_ids:
+        return active_accounts
+    active_map = {a.get("id"): a for a in active_accounts}
+    return [active_map[acc_id] for acc_id in selected_ids if acc_id in active_map]
+
+def _make_scheduler_label(account: dict, cfg: dict, idx: int = 1) -> str:
+    acc_name = account.get("name") or account.get("real_email") or account.get("id") or "account"
+    prefix = cfg.get("label_prefix", "").strip()
+    base = f"{acc_name} {_now().strftime('%m%d%H%M')}-{idx}"
+    return f"{prefix} {base}".strip() if prefix else base
+
+def _create_one_scheduled_alias(acc_id: str, label: str) -> dict:
+    try:
+        forward_to = _get_app_settings().get("forward_to_email", "")
+        results = _account_mgr.create_aliases_for_account(acc_id, count=1, label=label, forward_to=forward_to)
+        if results:
+            return results[0]
+        return {"ok": False, "email": None, "account_id": acc_id, "error": "create_alias 返回空结果"}
+    except Exception as e:
+        return {"ok": False, "email": None, "account_id": acc_id, "error": str(e)}
+
+_app_settings.update(_load_app_settings())
+_sync_app_state(_app_settings)
+_scheduler_config.update(_load_scheduler_config())
+_sync_scheduler_state(_scheduler_config)
+
+def _scheduler_loop_random_window():
     """后台调度器：北京时间 7:00-20:00，随机间隔 60-90min，每账号随机 3-5 个。"""
     import random as _random
-    from icloud_hme import ICloudHME
     _update_state(running=True, round_status="等待触发窗口")
-    _emit_log("info", "调度器已启动 (BJ 7-20h, 间隔 60-90min, 每轮 3-5 个)")
+    _emit_log("info", "调度器已启动 (随机窗口模式: BJ 7-20h, 间隔 60-90min, 每轮每账号 3-5 个)")
     def _bj_hour() -> int: return (_now().hour + 8) % 24
     while not _stop_event.is_set():
+        cfg = _get_scheduler_config()
         h = _bj_hour()
-        if h < 7 or h >= 20: _update_state(round_status=f"非窗口时段 (BJ {h}:00)，等待..."); _stop_event.wait(1800); continue
-        active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
-        if not active_accounts: _update_state(creating=False, round_status="无活跃账号，跳过"); _stop_event.wait(1800); continue
+        if h < 7 or h >= 20:
+            _update_state(creating=False, round_status=f"非窗口时段 (BJ {h}:00)，等待...", next_trigger=None)
+            _stop_event.wait(1800)
+            continue
+        active_accounts = _get_scheduler_accounts(cfg)
+        if not active_accounts:
+            _update_state(creating=False, round_status="无活跃账号，跳过", next_trigger=None)
+            _stop_event.wait(1800)
+            continue
         round_total = 0
+        _update_state(creating=True, round_status=f"随机窗口执行中 ({len(active_accounts)} 个账号)")
         for i, account in enumerate(active_accounts):
             if _stop_event.is_set(): break
             acc_id = account["id"]; acc_name = account.get("name", acc_id)
             target_count = _random.randint(3, 5)
             _emit_log("info", f"[{acc_name}] 本轮目标 {target_count} 个")
-            client = ICloudHME(account["cookies"], host=account.get("host","icloud.com"), verbose=False)
             created = 0; errors = 0
             while created < target_count and errors < 3 and not _stop_event.is_set():
-                try:
-                    result = client.create_alias(label=f"{acc_name} {_now().strftime('%m%d%H%M')}", max_retries=2)
-                    email = result.get("email","")
-                    if email:
-                        created += 1; round_total += 1
-                        _emit_log("success", f"[{acc_name}] ({created}/{target_count}) {email}")
-                        _increment_state(today_created=1, total_created=1)
-                        with open(str(RESULTS_DIR/"latest_emails.txt"),"a",encoding="utf-8") as f: f.write(f"{email}\t{acc_id}\n")
-                        _account_mgr.update_account(acc_id, alias_total=account.get("alias_total",0)+1)
-                        account["alias_total"] = account.get("alias_total",0)+1
-                        errors = 0; time.sleep(_random.uniform(15,45))
-                    else: errors += 1
-                except Exception as e:
-                    err_str = str(e)
-                    if _is_limit_error(err_str): _emit_log("info",f"[{acc_name}] 触达上限: {err_str[:60]}"); break
-                    errors += 1; _emit_log("warn",f"[{acc_name}] 失败: {err_str[:80]}")
-            if i < len(active_accounts)-1: time.sleep(_random.uniform(120,300))
+                result = _create_one_scheduled_alias(acc_id, _make_scheduler_label(account, cfg, created + 1))
+                email = result.get("email", "")
+                if result.get("ok") and email:
+                    created += 1; round_total += 1
+                    _emit_log("success", f"[{acc_name}] ({created}/{target_count}) {email}")
+                    _increment_state(today_created=1, total_created=1)
+                    errors = 0
+                    _stop_event.wait(_random.uniform(15, 45))
+                else:
+                    err_str = str(result.get("error", "未知错误"))
+                    if _is_limit_error(err_str):
+                        _emit_log("info", f"[{acc_name}] 触达上限: {err_str[:80]}")
+                        break
+                    errors += 1
+                    _emit_log("warn", f"[{acc_name}] 失败: {err_str[:100]}")
+            if i < len(active_accounts)-1 and not _stop_event.is_set():
+                _stop_event.wait(_random.uniform(120, 300))
         _update_state(creating=False, current_round_created=round_total, round_status=f"本轮创建 {round_total} 个")
         interval_sec = _random.randint(3600,5400)
         target = _now() + timedelta(seconds=interval_sec)
         _update_state(next_trigger=target.timestamp())
         _emit_log("info", f"下轮 {target.strftime('%H:%M')} (间隔 {interval_sec//60}min)")
         _stop_event.wait(interval_sec)
-    _update_state(running=False, next_trigger=None, round_status="已停止")
-    _emit_log("info", "调度器已停止")
+
+def _scheduler_loop_interval():
+    cfg = _get_scheduler_config()
+    _update_state(running=True, round_status="固定间隔计划已就绪")
+    _emit_log("info", f"调度器已启动 (固定间隔模式: 每 {cfg.get('interval_minutes',60)} 分钟创建 {cfg.get('count_per_run',1)} 个，活跃账号轮询)")
+    while not _stop_event.is_set():
+        cfg = _get_scheduler_config()
+        active_accounts = _get_scheduler_accounts(cfg)
+        interval_minutes = cfg.get("interval_minutes", 60)
+        count_per_run = cfg.get("count_per_run", 1)
+        if not active_accounts:
+            _update_state(creating=False, round_status="无活跃账号，等待...", next_trigger=None)
+            _stop_event.wait(30)
+            continue
+        target = _now() + timedelta(minutes=interval_minutes)
+        _update_state(creating=False, round_status=f"计划已设置: 每 {interval_minutes} 分钟创建 {count_per_run} 个", next_trigger=target.timestamp())
+        _emit_log("info", f"固定间隔计划: 下次 {target.strftime('%H:%M:%S')}，每轮 {count_per_run} 个")
+        if _stop_event.wait(interval_minutes * 60): break
+        round_total = 0
+        round_failed = False
+        round_error = ""
+        _update_state(creating=True, round_status=f"计划执行中: {count_per_run} 个")
+        for i in range(count_per_run):
+            if _stop_event.is_set(): break
+            active_accounts = _get_scheduler_accounts(cfg)
+            if not active_accounts:
+                _emit_log("warn", "计划执行中断: 无活跃账号")
+                break
+            rr_index = _scheduler_runtime.get("rr_index", 0) % len(active_accounts)
+            account = active_accounts[rr_index]
+            _scheduler_runtime["rr_index"] = (rr_index + 1) % len(active_accounts)
+            acc_id = account["id"]; acc_name = account.get("name", acc_id)
+            result = _create_one_scheduled_alias(acc_id, _make_scheduler_label(account, cfg, i + 1))
+            email = result.get("email", "")
+            if result.get("ok") and email:
+                round_total += 1
+                _increment_state(today_created=1, total_created=1)
+                _emit_log("success", f"[{acc_name}] 计划创建成功: {email}")
+            else:
+                err_str = str(result.get("error", "未知错误"))
+                if _is_limit_error(err_str):
+                    _emit_log("info", f"[{acc_name}] 计划创建触达上限: {err_str[:100]}")
+                else:
+                    _emit_log("warn", f"[{acc_name}] 计划创建失败: {err_str[:100]}")
+                round_failed = True
+                round_error = err_str[:300]
+                _update_state(last_error=round_error, round_status="计划创建失败，等待下个周期")
+                break
+            if i < count_per_run - 1 and not _stop_event.is_set():
+                gap = cfg.get("account_interval_sec", 3.0)
+                if gap > 0 and _stop_event.wait(gap): break
+        if round_failed:
+            _update_state(creating=False, current_round_created=round_total, last_error=round_error, round_status=f"上次计划失败，已等待下个周期；本轮成功 {round_total} 个")
+        else:
+            _update_state(creating=False, current_round_created=round_total, round_status=f"上次计划创建 {round_total} 个")
+
+def _scheduler_loop():
+    try:
+        _update_state(running=True, stopping=False, last_error=None)
+        if _get_scheduler_config().get("mode") == "interval":
+            _scheduler_loop_interval()
+        else:
+            _scheduler_loop_random_window()
+    finally:
+        _update_state(running=False, creating=False, stopping=False, next_trigger=None, round_status="已停止")
+        _emit_log("info", "调度器已停止")
 
 def _health_loop():
     _error_reported = set()
@@ -801,6 +1464,153 @@ UI_HTML = r"""<!DOCTYPE html>
             outline: none;
             border-color: var(--ink);
         }
+        .mail-admin-shell {
+            display: grid;
+            grid-template-columns: 300px minmax(340px, 430px) minmax(420px, 1fr);
+            gap: 1px;
+            background: var(--rule-strong);
+            border: 1px solid var(--rule-strong);
+            min-height: calc(100vh - 190px);
+        }
+        .mail-pane {
+            background: var(--paper);
+            min-height: calc(100vh - 190px);
+            max-height: calc(100vh - 190px);
+            overflow: auto;
+        }
+        .mail-pane-head {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            background: var(--paper);
+            border-bottom: 1px solid var(--rule-strong);
+            padding: 12px 14px;
+            font-family: var(--mono);
+        }
+        .mail-pane-title {
+            font-size: 11px;
+            color: var(--ink-faint);
+            letter-spacing: .18em;
+            text-transform: uppercase;
+        }
+        .mail-pane-sub {
+            margin-top: 4px;
+            color: var(--ink-soft);
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .mail-address-row {
+            display: block;
+            width: 100%;
+            border: 0;
+            border-bottom: 1px solid var(--rule);
+            background: transparent;
+            padding: 11px 14px;
+            text-align: left;
+            cursor: pointer;
+            font-family: var(--mono);
+            color: var(--ink);
+        }
+        .mail-address-row:hover,
+        .mail-address-row.active {
+            background: var(--paper-dim);
+        }
+        .mail-address-row.active {
+            box-shadow: inset 3px 0 0 var(--red);
+        }
+        .mail-address-main {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            align-items: center;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .mail-badge {
+            min-width: 22px;
+            padding: 1px 6px;
+            border: 1px solid var(--rule-strong);
+            color: var(--ink-soft);
+            text-align: center;
+            font-size: 11px;
+            flex: 0 0 auto;
+            background: var(--paper);
+        }
+        .mail-address-meta {
+            margin-top: 4px;
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            color: var(--ink-faint);
+            font-size: 10px;
+        }
+        .mail-list-item {
+            border: 0;
+            border-bottom: 1px solid var(--rule);
+            background: transparent;
+            width: 100%;
+            text-align: left;
+            padding: 13px 14px;
+            cursor: pointer;
+            color: var(--ink);
+            font-family: var(--mono);
+        }
+        .mail-list-item:hover,
+        .mail-list-item.active {
+            background: var(--paper-dim);
+        }
+        .mail-subject {
+            font-weight: 700;
+            font-size: 13px;
+            margin-bottom: 5px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .mail-meta {
+            color: var(--ink-soft);
+            font-size: 11px;
+            line-height: 1.5;
+            word-break: break-all;
+        }
+        .mail-preview {
+            padding: 18px 20px;
+        }
+        .mail-preview h2 {
+            font-size: 18px;
+            margin-bottom: 10px;
+            line-height: 1.35;
+        }
+        .mail-preview-meta {
+            border: 1px solid var(--rule);
+            background: var(--paper-dim);
+            padding: 10px 12px;
+            font-family: var(--mono);
+            font-size: 12px;
+            color: var(--ink-soft);
+            line-height: 1.7;
+            word-break: break-all;
+            margin-bottom: 14px;
+        }
+        .mail-preview-body {
+            border: 1px solid var(--rule);
+            background: #fff;
+            padding: 12px;
+            max-height: calc(100vh - 410px);
+            overflow: auto;
+        }
+        .mail-preview-body iframe {
+            width: 100%;
+            border: 0;
+            background: #fff;
+            min-height: 320px;
+        }
+        .mail-preview-body pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: var(--mono);
+            margin: 0;
+        }
         @media(max-width:768px) {
             body {
                 flex-direction: column;
@@ -825,6 +1635,13 @@ UI_HTML = r"""<!DOCTYPE html>
             .acc-cards {
                 grid-template-columns: 1fr;
             }
+            .mail-admin-shell {
+                grid-template-columns: 1fr;
+            }
+            .mail-pane {
+                min-height: 320px;
+                max-height: none;
+            }
         }
     </style>
 </head>
@@ -834,7 +1651,7 @@ UI_HTML = r"""<!DOCTYPE html>
         <a class="nav-item active" data-tab="dashboard">仪表盘</a>
         <a class="nav-item" data-tab="emails">邮箱列表</a>
         <a class="nav-item" data-tab="batch">批量创建</a>
-        <a class="nav-item" data-tab="inbox">收件箱</a>
+        <a class="nav-item" data-tab="local-inbox">收件箱</a>
         <a class="nav-item" data-tab="docs">API 文档</a>
         <a class="nav-item" data-tab="logs">运行日志</a>
         <div class="section-label">账号列表</div>
@@ -845,7 +1662,43 @@ UI_HTML = r"""<!DOCTYPE html>
                 <span class="status-dot" id="schedDot"></span>
                 <span id="schedLabel">调度器: 就绪</span>
             </div>
-            <button class="btn btn-sm" id="btnSched" onclick="toggleScheduler()" style="width:100%;margin-top:6px">启动调度器</button>
+            <div style="display:grid;gap:8px;margin-top:10px">
+                <div>
+                    <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">计划模式</div>
+                    <select id="schedMode" onchange="renderSchedulerConfigForm()" style="width:100%">
+                        <option value="window_random">随机窗口</option>
+                        <option value="interval">固定间隔</option>
+                    </select>
+                </div>
+                <div id="schedIntervalGroup" style="display:none">
+                    <div style="display:flex;gap:8px">
+                        <div style="flex:1">
+                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">间隔(分钟)</div>
+                            <input type="number" id="schedIntervalMin" value="60" min="1" max="1440" style="width:100%">
+                        </div>
+                        <div style="width:86px">
+                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">每轮数量</div>
+                            <input type="number" id="schedCount" value="1" min="1" max="20" style="width:100%">
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:8px">
+                        <div style="width:86px">
+                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">间隔秒</div>
+                            <input type="number" id="schedGapSec" value="3" min="0" max="600" style="width:100%">
+                        </div>
+                        <div style="flex:1">
+                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">标签前缀</div>
+                            <input type="text" id="schedLabelPrefix" placeholder="可选" style="width:100%">
+                        </div>
+                    </div>
+                    <div style="font-size:11px;color:var(--ink-faint);margin-top:6px">在所有活跃账号之间轮询；启动后按设定间隔执行。</div>
+                </div>
+                <div id="schedWindowHint" style="font-size:11px;color:var(--ink-faint)">北京时间 7:00-20:00 自动运行，轮次间隔 60-90 分钟，每轮每账号随机创建 3-5 个。</div>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:8px">
+                <button class="btn btn-outline btn-sm" onclick="saveSchedulerConfig()" style="flex:1">保存计划</button>
+                <button class="btn btn-sm" id="btnSched" onclick="toggleScheduler()" style="flex:1">启动调度器</button>
+            </div>
         </div>
     </aside>
     <main class="main">
@@ -859,6 +1712,36 @@ UI_HTML = r"""<!DOCTYPE html>
         
         <div id="view-dashboard">
             <div class="cards" id="summaryCards"></div>
+            <div class="panel" style="margin-top:16px">
+                <div class="panel-header">
+                    <span>全局邮箱设置</span>
+                    <span style="font-size:11px;color:var(--ink-faint)">影响新建记录展示 / 新建别名转发</span>
+                </div>
+                <div class="panel-body" style="padding:14px">
+                    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+                        <label style="font-size:13px;display:flex;gap:6px;align-items:center">
+                            <input type="checkbox" id="aliasSplitEnabled">
+                            每个隐私邮箱额外派生
+                        </label>
+                        <input type="number" id="aliasSplitCount" value="4" min="1" max="20" style="width:70px">
+                        <span style="font-size:12px;color:var(--ink-faint)">个变体，例如 <code>name+1@icloud.com</code> ~ <code>name+4@icloud.com</code></span>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px">
+                        <label style="font-size:13px;font-family:var(--mono)">转发地址:</label>
+                        <select id="forwardToEmail" style="width:360px;max-width:100%">
+                            <option value="">加载 Apple 账号转发地址中...</option>
+                        </select>
+                        <button class="btn btn-outline btn-sm" onclick="refreshForwardOptions(true)">刷新转发地址</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveAppSettings()">保存设置</button>
+                    </div>
+                    <div id="forwardOptionsHint" style="font-size:11px;color:var(--ink-faint);margin-top:6px">
+                        转发地址来自 Apple 账号里已绑定/允许的邮箱；留空则使用 iCloud 当前默认转发地址。
+                    </div>
+                    <div style="font-size:11px;color:var(--ink-faint);margin-top:8px">
+                        说明：派生地址为本地加号地址，不会额外消耗 iCloud HME 创建额度；转发地址必须是 Apple 账号里已允许的转发邮箱，否则 Apple 可能拒绝创建。
+                    </div>
+                </div>
+            </div>
             <div class="acc-cards" id="accCards"></div>
         </div>
         
@@ -869,9 +1752,10 @@ UI_HTML = r"""<!DOCTYPE html>
                     <div style="display:flex;gap:8px;align-items:center">
                         <span style="font-size:11px;color:var(--ink-faint)" id="emailCount">0</span>
                         <button class="btn btn-outline btn-sm" onclick="refreshEmails().then(renderAliasTable)">刷新</button>
-                        <button class="btn btn-outline btn-sm" onclick="refreshAliases()" title="从 iCloud 云端同步标签和状态">云端同步</button>
+                        <button class="btn btn-outline btn-sm" onclick="refreshAliases()" title="从 iCloud 云端同步所有历史别名，并生成派生地址">云端同步历史</button>
                         <button class="btn btn-outline btn-sm" onclick="copyAll()">复制全部</button>
                         <button class="btn btn-outline btn-sm" onclick="exportCSV()">CSV</button>
+                        <button class="btn btn-primary btn-sm" onclick="exportCredentials()">导出凭证</button>
                     </div>
                 </div>
                 <div class="filter-bar">
@@ -934,6 +1818,53 @@ UI_HTML = r"""<!DOCTYPE html>
                 </div>
             </div>
         </div>
+
+        <div id="view-local-inbox" style="display:none">
+            <div class="panel">
+                <div class="panel-header">
+                    <span>Admin 收件箱</span>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <button class="btn btn-outline btn-sm" onclick="loadAllLocalInbox()">全部邮件</button>
+                        <input type="text" id="localAliasSearch" placeholder="搜索邮箱 / 负责人" style="width:220px">
+                        <select id="localAssigneeFilter" style="width:140px"><option value="">全部负责人</option></select>
+                        <button class="btn btn-outline btn-sm" onclick="refreshLocalInbox(true)">刷新</button>
+                        <button class="btn btn-outline btn-sm" onclick="openWorkerConfig()">Worker 配置</button>
+                    </div>
+                </div>
+                <div class="panel-body" style="padding:14px">
+                    <div id="localInboxStats" style="font-size:12px;color:var(--ink-faint);margin-bottom:10px"></div>
+                    <div class="mail-admin-shell">
+                        <aside class="mail-pane">
+                            <div class="mail-pane-head">
+                                <div class="mail-pane-title">Mailboxes</div>
+                                <div class="mail-pane-sub">点邮箱只看该邮箱；点“全部邮件”看所有入站邮件。</div>
+                            </div>
+                            <div id="localAliasTable">
+                                <div class="empty"><div class="icon"></div>加载邮箱列表...</div>
+                            </div>
+                        </aside>
+                        <section class="mail-pane">
+                            <div class="mail-pane-head">
+                                <div class="mail-pane-title" id="localMessageTitle">全部邮件</div>
+                                <div class="mail-pane-sub" id="localMessageSub">所有邮箱的入站邮件</div>
+                            </div>
+                            <div id="localMessageList">
+                                <div class="empty"><div class="icon"></div>加载邮件列表...</div>
+                            </div>
+                        </section>
+                        <section class="mail-pane">
+                            <div class="mail-pane-head">
+                                <div class="mail-pane-title">Preview</div>
+                                <div class="mail-pane-sub" id="localPreviewSub">选择一封邮件查看正文</div>
+                            </div>
+                            <div id="localPreview" class="empty">
+                                <div class="icon"></div>选择中间列表的一封邮件查看内容
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </div>
         
         <div id="view-docs" style="display:none">
             <div class="panel" style="font-family:var(--mono);font-size:13px;line-height:1.8">
@@ -961,8 +1892,10 @@ UI_HTML = r"""<!DOCTYPE html>
     
     <script>
         var E = function(id){ return document.getElementById(id); };
-        var state = {running:false,creating:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null};
+        var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:false,alias_split_count:4,forward_to_email:''};
         var accounts = [], emails = [], logs = [];
+        var forwardOptions = {loaded:false,loading:false,emails:[],selected:'',current:'',accounts:[],error:''};
+        var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedAccount = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false;
         var curTab = 'dashboard', sseConn = null;
         
         document.querySelectorAll('.nav-item').forEach(function(el){
@@ -975,10 +1908,11 @@ UI_HTML = r"""<!DOCTYPE html>
                 E('view-emails').style.display = curTab==='emails'?'block':'none';
                 E('view-batch').style.display = curTab==='batch'?'block':'none';
                 E('view-inbox').style.display = curTab==='inbox'?'block':'none';
+                E('view-local-inbox').style.display = curTab==='local-inbox'?'block':'none';
                 E('view-docs').style.display = curTab==='docs'?'block':'none';
                 E('view-logs').style.display = curTab==='logs'?'block':'none';
                 
-                var titles = {dashboard:'仪表盘',emails:'邮箱列表',batch:'批量创建',inbox:'收件箱',docs:'API 文档',logs:'运行日志'};
+                var titles = {dashboard:'仪表盘',emails:'邮箱列表',batch:'批量创建',inbox:'旧 IMAP 收件箱', 'local-inbox':'收件箱', docs:'API 文档',logs:'运行日志'};
                 E('tabTitle').textContent = titles[curTab]||curTab;
                 
                 if(curTab==='emails'){
@@ -987,6 +1921,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 }
                 if(curTab==='batch') renderBatchPanel();
                 if(curTab==='inbox') updateInboxAccountSelect();
+                if(curTab==='local-inbox') refreshLocalInbox();
                 if(curTab==='docs') renderDocs();
                 if(curTab==='logs') renderLogs();
             });
@@ -1011,6 +1946,116 @@ UI_HTML = r"""<!DOCTYPE html>
         async function apiSlow(path,opts){
             return api(path,Object.assign({timeout:60000},opts||{}));
         }
+
+        function collectSchedulerConfig(){
+            return {
+                mode: E('schedMode') ? E('schedMode').value : 'window_random',
+                interval_minutes: Math.max(1, Math.min(1440, parseInt((E('schedIntervalMin')||{}).value || '60', 10) || 60)),
+                count_per_run: Math.max(1, Math.min(20, parseInt((E('schedCount')||{}).value || '1', 10) || 1)),
+                account_interval_sec: Math.max(0, Math.min(600, parseFloat((E('schedGapSec')||{}).value || '3') || 3)),
+                label_prefix: ((E('schedLabelPrefix')||{}).value || '').trim()
+            };
+        }
+
+        function renderSchedulerConfigForm(){
+            if(!E('schedMode')) return;
+            var mode = E('schedMode').value || 'window_random';
+            E('schedIntervalGroup').style.display = mode==='interval' ? 'block' : 'none';
+            E('schedWindowHint').style.display = mode==='window_random' ? 'block' : 'none';
+        }
+
+        function applySchedulerState(){
+            if(E('schedMode')) E('schedMode').value = state.scheduler_mode || 'window_random';
+            if(E('schedIntervalMin')) E('schedIntervalMin').value = state.scheduler_interval_minutes || 60;
+            if(E('schedCount')) E('schedCount').value = state.scheduler_count_per_run || 1;
+            if(E('schedGapSec')) E('schedGapSec').value = state.scheduler_account_interval_sec || 3;
+            if(E('schedLabelPrefix')) E('schedLabelPrefix').value = state.scheduler_label_prefix || '';
+            renderSchedulerConfigForm();
+        }
+
+        function applyAppSettingsState(){
+            if(E('aliasSplitEnabled')) E('aliasSplitEnabled').checked = !!state.alias_split_enabled;
+            if(E('aliasSplitCount')) E('aliasSplitCount').value = state.alias_split_count || 4;
+            renderForwardOptions();
+        }
+
+        function _emailInList(email, list){
+            email = String(email||'').toLowerCase();
+            return (list||[]).some(function(x){ return String(x||'').toLowerCase()===email; });
+        }
+
+        function renderForwardOptions(){
+            var sel = E('forwardToEmail');
+            if(!sel) return;
+            var emails = forwardOptions.emails || [];
+            var current = state.forward_to_email || forwardOptions.current || '';
+            var preferred = current || forwardOptions.selected || '';
+            var before = sel.value || preferred;
+            var html = ['<option value="">使用 iCloud 当前默认转发地址</option>'];
+            if(preferred && !_emailInList(preferred, emails)){
+                html.push('<option value="'+escAttr(preferred)+'">当前保存: '+esc(preferred)+'（未在 Apple 可选列表中）</option>');
+            }
+            emails.forEach(function(email){
+                var label = email;
+                if(forwardOptions.selected && String(email).toLowerCase()===String(forwardOptions.selected).toLowerCase()){
+                    label += '（Apple 当前默认）';
+                }
+                html.push('<option value="'+escAttr(email)+'">'+esc(label)+'</option>');
+            });
+            sel.innerHTML = html.join('');
+            sel.value = before || preferred || '';
+            if(sel.value && !_emailInList(sel.value, emails) && sel.value !== preferred){
+                sel.value = preferred || '';
+            }
+
+            var hint = E('forwardOptionsHint');
+            if(hint){
+                if(forwardOptions.loading){
+                    hint.textContent = '正在从 Apple 账号读取已绑定转发邮箱...';
+                    hint.style.color = 'var(--ink-faint)';
+                } else if(forwardOptions.error){
+                    hint.textContent = '读取转发地址失败: '+forwardOptions.error;
+                    hint.style.color = 'var(--red)';
+                } else if(forwardOptions.loaded){
+                    var okAccounts = (forwardOptions.accounts||[]).filter(function(a){return a.ok;}).length;
+                    hint.textContent = emails.length
+                        ? ('已从 '+okAccounts+' 个账号读取到 '+emails.length+' 个可选转发地址。')
+                        : '未读取到 Apple 可选转发地址；请确认账号 Cookie 有效，或留空使用 iCloud 默认转发地址。';
+                    hint.style.color = 'var(--ink-faint)';
+                } else {
+                    hint.textContent = '转发地址来自 Apple 账号里已绑定/允许的邮箱；留空则使用 iCloud 当前默认转发地址。';
+                    hint.style.color = 'var(--ink-faint)';
+                }
+            }
+        }
+
+        async function refreshForwardOptions(showToast){
+            if(forwardOptions.loading) return;
+            forwardOptions.loading = true;
+            forwardOptions.error = '';
+            renderForwardOptions();
+            var d = await api('/api/forward-options',{timeout:120000});
+            if(d.ok){
+                forwardOptions = {
+                    loaded:true,
+                    loading:false,
+                    emails:d.emails||[],
+                    selected:d.selected||'',
+                    current:d.current||'',
+                    accounts:d.accounts||[],
+                    error:''
+                };
+                if(d.current !== undefined) state.forward_to_email = d.current || '';
+                renderForwardOptions();
+                if(showToast) toast('转发地址已刷新');
+            } else {
+                forwardOptions.loading = false;
+                forwardOptions.loaded = true;
+                forwardOptions.error = d.error || '未知错误';
+                renderForwardOptions();
+                if(showToast) toast('读取转发地址失败: '+forwardOptions.error,true);
+            }
+        }
         
         var _refreshBusy = false;
         async function refreshAll(){
@@ -1021,13 +2066,19 @@ UI_HTML = r"""<!DOCTYPE html>
                 var a = await _a, s = await _s;
                 accounts = a.accounts||[];
                 state = s;
+                applySchedulerState();
+                applyAppSettingsState();
                 renderSidebar();
                 renderDashboard();
+                if(!forwardOptions.loaded){
+                    await refreshForwardOptions(false);
+                }
                 await refreshEmails();
                 if(curTab==='emails'){
                     renderAliasTable();
                 }
                 if(curTab==='batch') renderBatchPanel();
+                if(curTab==='local-inbox') refreshLocalInbox();
                 updateInboxAccountSelect();
             } finally {
                 _refreshBusy = false;
@@ -1038,10 +2089,12 @@ UI_HTML = r"""<!DOCTYPE html>
             if(_refreshBusy) return;
             var s = await api('/api/state');
             state = s;
+            applySchedulerState();
+            applyAppSettingsState();
             var sd = E('schedDot');
             var running = state.running;
             sd.className = 'status-dot '+(running?'online':'offline');
-            E('schedLabel').textContent = '调度器: '+(running?(state.creating?'创建中...':'等待下轮'):'已停止');
+            E('schedLabel').textContent = '调度器: '+(state.stopping?'停止收尾':(running?(state.creating?'创建中...':'等待下轮'):'已停止'));
             E('btnSched').textContent = running?'停止调度器':'启动调度器';
             E('btnSched').className = 'btn btn-sm '+(running?'btn-danger':'btn-primary');
         }
@@ -1059,22 +2112,37 @@ UI_HTML = r"""<!DOCTYPE html>
         }
         
         async function refreshAliases(){
-            var d = await api('/api/aliases');
+            var d = await api('/api/aliases',{timeout:120000});
             var apiAliases = d.aliases||[];
             if(apiAliases.length){
-                var apiMap = {};
-                apiAliases.forEach(function(a){ apiMap[a.email] = a; });
-                emails.forEach(function(e){
-                    var apiData = apiMap[e.email];
-                    if(apiData){
-                        e.label = apiData.label||'';
-                        e.active = apiData.active;
-                        e.anonymousId = apiData.anonymousId;
-                        e.account_name = apiData.account_name||e.account_name;
-                        e.account_email = apiData.account_email||e.account_email;
+                var order = [], merged = {};
+                function keyOf(e){
+                    return String(e.account_id||'')+'|'+String(e.email||'').toLowerCase();
+                }
+                function putRecord(e, preferIncoming){
+                    if(!e || !e.email) return;
+                    var k = keyOf(e);
+                    if(!merged[k]){
+                        order.push(k);
+                        merged[k] = Object.assign({}, e);
+                        return;
                     }
-                });
+                    var old = merged[k], next = Object.assign({}, old);
+                    Object.keys(e).forEach(function(field){
+                        var v = e[field];
+                        if(preferIncoming || old[field]===undefined || old[field]===null || old[field]===''){
+                            if(v!==undefined && v!==null && v!=='') next[field] = v;
+                            if(field==='active' || field==='derived') next[field] = v;
+                        }
+                    });
+                    merged[k] = next;
+                }
+                emails.forEach(function(e){ putRecord(e,false); });
+                apiAliases.forEach(function(a){ putRecord(a,true); });
+                emails = order.map(function(k){ return merged[k]; });
             }
+            if(d.ok === false) toast('云端同步失败: '+(d.error||'?'),true);
+            else toast('云端同步完成: '+(d.base_count||apiAliases.length)+' 个基础别名，含派生共 '+emails.length+' 条');
             E('emailCount').textContent = emails.length;
             updateEmailFilter();
             renderAliasTable();
@@ -1093,14 +2161,16 @@ UI_HTML = r"""<!DOCTYPE html>
             }
             var sd = E('schedDot');
             sd.className = 'status-dot '+(state.running?'online':'offline');
-            var sm = state.running?(state.creating?'创建中...':'等待下轮'):'已停止';
+            var sm = state.stopping?'停止收尾':(state.running?(state.creating?'创建中...':'等待下轮'):'已停止');
             E('schedLabel').textContent = '调度器: '+sm;
             var bs = E('btnSched');
             bs.textContent = state.running?'停止调度器':'启动调度器';
             bs.className = 'btn btn-sm '+(state.running?'btn-danger':'btn-primary');
+            applySchedulerState();
         }
         
         function renderDashboard(){
+            applyAppSettingsState();
             var summary = {account_count:accounts.length,active_accounts:0,error_accounts:0,total_aliases:0,total_active_aliases:0};
             accounts.forEach(function(a){
                 if(a.status==='active') summary.active_accounts++;
@@ -1116,7 +2186,7 @@ UI_HTML = r"""<!DOCTYPE html>
                     var stCls = a.status==='active'?'ok':'err';
                     var stText = a.status==='active'?'正常':(a.last_error||'异常');
                     var email = a.real_email||'?';
-                    return '<div class="acc-card"><div class="acc-header"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'">'+esc(stText.substring(0,20))+'</span></div><div class="acc-stats"><div class="acc-stat">别名: <span class="n">'+(a.alias_total||0)+'</span></div><div class="acc-stat">活跃: <span class="n" style="color:var(--green)">'+(a.alias_active||0)+'</span></div></div><div class="acc-actions"><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',1)">创建 1 个</button><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建 5 个</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">校验</button></div></div>';
+                    return '<div class="acc-card"><div class="acc-header"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'" title="'+escAttr(stText)+'">'+esc(stText.substring(0,20))+'</span></div><div class="acc-stats"><div class="acc-stat">别名: <span class="n">'+(a.alias_total||0)+'</span></div><div class="acc-stat">活跃: <span class="n" style="color:var(--green)">'+(a.alias_active||0)+'</span></div></div><div class="acc-actions"><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',1)">创建 1 个</button><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建 5 个</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">校验</button><button class="btn btn-outline btn-xs" onclick="showUpdateCookieModal(\''+escAttr(a.id)+'\')">更新 Cookie</button><button class="btn btn-danger btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除账号</button></div></div>';
                 }).join('');
             }
         }
@@ -1152,7 +2222,7 @@ UI_HTML = r"""<!DOCTYPE html>
             E('emailCount').textContent = filtered.length+' / '+emails.length;
             var c = E('aliasTableContainer');
             if(!filtered.length){
-                c.innerHTML = '<div class="empty"><div class="icon"></div>暂无创建记录 — 请先通过仪表盘或批量创建生成邮箱</div>';
+                c.innerHTML = '<div class="empty"><div class="icon"></div>暂无邮箱记录 — 请先创建，或点击“云端同步历史”拉取之前注册过的隐私邮箱</div>';
                 return;
             }
             var totalPages = Math.ceil(filtered.length / _aliasPerPage);
@@ -1212,7 +2282,263 @@ UI_HTML = r"""<!DOCTYPE html>
             }
             refreshAll();
         }
-        
+
+        async function refreshLocalInbox(force){
+            if(!E('localAliasTable')) return;
+            var q = ((E('localAliasSearch')||{}).value||'').trim();
+            var assignee = ((E('localAssigneeFilter')||{}).value||'').trim();
+            var d = await api('/api/local-inbox/summary?q='+encodeURIComponent(q)+'&assignee='+encodeURIComponent(assignee));
+            if(!d.ok){
+                E('localAliasTable').innerHTML = '<div class="empty"><div class="icon"></div>'+esc(d.error||'加载失败')+'</div>';
+                return;
+            }
+            localAliases = d.aliases||[];
+            renderLocalAssigneeFilter(d.assignees||[]);
+            renderLocalAliasTable(d.stats||{});
+            if(!localInboxLoaded || force){
+                localInboxLoaded = true;
+                localMsgOffset = 0;
+                loadLocalMessages(localSelectedAlias || '', 0);
+            }
+        }
+
+        function renderLocalAssigneeFilter(assignees){
+            var sel = E('localAssigneeFilter');
+            if(!sel) return;
+            var old = sel.value || '';
+            var html = '<option value="">全部负责人</option>';
+            assignees.forEach(function(name){ html += '<option value="'+escAttr(name)+'">'+esc(name)+'</option>'; });
+            sel.innerHTML = html;
+            sel.value = old;
+            sel.onchange = function(){ localMsgOffset=0; refreshLocalInbox(true); };
+            var search = E('localAliasSearch');
+            if(search && !search.dataset.bound){
+                search.dataset.bound = '1';
+                search.addEventListener('keydown', function(e){ if(e.key==='Enter'){ localMsgOffset=0; refreshLocalInbox(true); } });
+            }
+        }
+
+        function renderLocalAliasTable(stats){
+            var box = E('localAliasTable');
+            if(!box) return;
+            if(E('localInboxStats')){
+                E('localInboxStats').textContent = '全部邮件 '+(stats.total_mails||0)+' 封 / 已收件邮箱 '+(stats.alias_count||0)+' 个 / 可分发邮箱 '+(stats.known_alias_count||localAliases.length||0)+' 个 / 已启用分享 '+(stats.share_count||0)+' 个';
+            }
+            var h = '';
+            h += '<button class="mail-address-row '+(!localSelectedAlias?'active':'')+'" id="localAllInboxBtn">'
+              + '<div class="mail-address-main"><span>全部邮件</span><span class="mail-badge">'+(stats.total_mails||0)+'</span></div>'
+              + '<div class="mail-address-meta"><span>Admin Inbox</span><span>所有邮箱</span></div></button>';
+            if(!localAliases.length){
+                h += '<div class="empty"><div class="icon"></div>暂无邮箱。配置 Worker 后，收到的邮件会显示在这里。</div>';
+                box.innerHTML = h;
+                var allBtn = E('localAllInboxBtn'); if(allBtn) allBtn.onclick = loadAllLocalInbox;
+                return;
+            }
+            localAliases.forEach(function(a){
+                var alias = a.alias || '';
+                var active = alias===localSelectedAlias ? 'active' : '';
+                var assignee = a.assignee || '未分配';
+                var latest = (a.latest_at||'').substring(0,16) || '暂无邮件';
+                h += '<button class="mail-address-row local-address-btn '+active+'" data-alias="'+escAttr(alias)+'">'
+                  + '<div class="mail-address-main"><span>'+esc(alias)+'</span><span class="mail-badge">'+(a.mail_count||0)+'</span></div>'
+                  + '<div class="mail-address-meta"><span>'+esc(assignee)+'</span><span>'+esc(latest)+'</span></div>'
+                  + '</button>';
+            });
+            box.innerHTML = h;
+            var allBtn = E('localAllInboxBtn'); if(allBtn) allBtn.onclick = loadAllLocalInbox;
+            box.querySelectorAll('.local-address-btn').forEach(function(btn){
+                btn.addEventListener('click', function(){ selectLocalAlias(this.getAttribute('data-alias')||''); });
+            });
+        }
+
+        function loadAllLocalInbox(){
+            localSelectedAlias = '';
+            localSelectedAccount = '';
+            localSelectedMailId = null;
+            localMsgOffset = 0;
+            if(E('localPreview')) E('localPreview').innerHTML = '<div class="empty"><div class="icon"></div>选择中间列表的一封邮件查看内容</div>';
+            renderLocalAliasTable({total_mails:state.local_mail_count||0, alias_count:state.local_mail_alias_count||0, share_count:state.local_mail_share_count||0, known_alias_count:localAliases.length});
+            loadLocalMessages('', 0);
+        }
+
+        function selectLocalAlias(alias){
+            if(!alias){ loadAllLocalInbox(); return; }
+            localSelectedAlias = alias;
+            localMsgOffset = 0;
+            localSelectedMailId = null;
+            var row = localAliases.find(function(a){return a.alias===alias});
+            localSelectedAccount = row ? (row.account_id||'') : '';
+            if(E('localPreview')) E('localPreview').innerHTML = '<div class="empty"><div class="icon"></div>选择中间列表的一封邮件查看内容</div>';
+            renderLocalAliasTable({total_mails:state.local_mail_count||0, alias_count:state.local_mail_alias_count||0, share_count:state.local_mail_share_count||0, known_alias_count:localAliases.length});
+            loadLocalMessages(alias, 0);
+        }
+
+        async function loadLocalMessages(alias, offset){
+            alias = alias || '';
+            localSelectedAlias = alias;
+            localMsgOffset = Math.max(0, offset||0);
+            var title = alias ? alias : '全部邮件';
+            var sub = alias ? '只看这个邮箱的邮件' : '所有邮箱的入站邮件';
+            if(E('localMessageTitle')) E('localMessageTitle').textContent = title;
+            if(E('localMessageSub')) E('localMessageSub').textContent = sub;
+            if(E('localMessageList')) E('localMessageList').innerHTML = '<div class="empty"><div class="icon"></div>加载邮件列表...</div>';
+            var url = '/api/local-inbox/messages?limit='+localMsgLimit+'&offset='+localMsgOffset;
+            if(alias) url += '&alias='+encodeURIComponent(alias);
+            var d = await api(url);
+            if(!d.ok){
+                E('localMessageList').innerHTML = '<div class="empty"><div class="icon"></div>'+esc(d.error||'加载失败')+'</div>';
+                return;
+            }
+            localMessages = d.messages||[];
+            localMsgTotal = d.count||0;
+            renderLocalMessages();
+        }
+
+        function localMsgPage(delta){
+            var next = localMsgOffset + delta*localMsgLimit;
+            if(next < 0) next = 0;
+            if(next >= localMsgTotal) next = Math.max(0, localMsgTotal-localMsgLimit);
+            loadLocalMessages(localSelectedAlias, next);
+        }
+
+        function renderLocalMessages(){
+            var box = E('localMessageList');
+            if(!box) return;
+            if(!localMessages.length){
+                box.innerHTML = '<div class="empty"><div class="icon"></div>'+(localSelectedAlias?'这个邮箱暂无邮件':'暂无入站邮件')+'</div>';
+                return;
+            }
+            var h = '<div style="font-size:11px;color:var(--ink-faint);padding:9px 14px;border-bottom:1px solid var(--rule)">共 '+localMsgTotal+' 封，当前 '+(localMsgOffset+1)+'-'+Math.min(localMsgOffset+localMsgLimit,localMsgTotal)+'</div>';
+            localMessages.forEach(function(m){
+                var active = String(m.id)===String(localSelectedMailId) ? 'active' : '';
+                h += '<button class="mail-list-item local-mail-btn '+active+'" data-id="'+escAttr(m.id)+'">'
+                  + '<div class="mail-subject">'+esc(m.subject||'(无主题)')+'</div>'
+                  + '<div class="mail-meta">From: '+esc(m.from||m.sender_name||'')+'</div>'
+                  + '<div class="mail-meta">To: '+esc(m.hme_alias||'')+'</div>'
+                  + '<div class="mail-meta">'+esc((m.created_at||'').substring(0,19))+(m.assignee?' · '+esc(m.assignee):'')+'</div>'
+                  + '</button>';
+            });
+            if(localMsgTotal > localMsgLimit){
+                h += '<div class="pagination-bar"><button onclick="localMsgPage(-1)" '+(localMsgOffset<=0?'disabled':'')+'>← 上一页</button><span>'+Math.floor(localMsgOffset/localMsgLimit+1)+' / '+Math.ceil(localMsgTotal/localMsgLimit)+'</span><button onclick="localMsgPage(1)" '+(localMsgOffset+localMsgLimit>=localMsgTotal?'disabled':'')+'>下一页 →</button></div>';
+            }
+            box.innerHTML = h;
+            box.querySelectorAll('.local-mail-btn').forEach(function(btn){
+                btn.addEventListener('click', function(){ openLocalMail(this.getAttribute('data-id')); });
+            });
+            if(!localSelectedMailId && localMessages.length){
+                openLocalMail(localMessages[0].id);
+            }
+        }
+
+        async function openLocalMail(msgId){
+            if(!msgId) return;
+            localSelectedMailId = String(msgId);
+            document.querySelectorAll('.local-mail-btn').forEach(function(btn){
+                btn.classList.toggle('active', String(btn.getAttribute('data-id'))===String(msgId));
+            });
+            var preview = E('localPreview');
+            if(preview) preview.innerHTML = '<div class="empty"><div class="icon"></div>加载邮件内容...</div>';
+            var d = await apiSlow('/api/local-inbox/messages/'+encodeURIComponent(msgId));
+            if(!d.ok || !d.message){
+                if(preview) preview.innerHTML = '<div class="empty"><div class="icon"></div>'+(d.error||'加载失败')+'</div>';
+                return;
+            }
+            renderLocalPreview(d.message);
+        }
+
+        function renderLocalPreview(m){
+            var preview = E('localPreview');
+            if(!preview) return;
+            if(E('localPreviewSub')) E('localPreviewSub').textContent = (m.hme_alias||'') + ' · ' + ((m.created_at||'').substring(0,19));
+            var h = '<div class="mail-preview">'
+              + '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px">'
+              + '<h2>'+esc(m.subject||'(无主题)')+'</h2>'
+              + '<button class="copy-btn" id="btnShareCurrentAlias">分配/分享</button>'
+              + '</div>'
+              + '<div class="mail-preview-meta">'
+              + '<div><b>From:</b> '+esc(m.source_from||m.sender_name||m.from||'')+'</div>'
+              + '<div><b>To:</b> '+esc(m.hme_alias||'')+'</div>'
+              + '<div><b>Time:</b> '+esc((m.created_at||'').substring(0,19))+'</div>'
+              + (m.assignee?'<div><b>Assignee:</b> '+esc(m.assignee)+'</div>':'')
+              + '</div>'
+              + '<div class="mail-preview-body" id="localPreviewBody"></div>'
+              + '</div>';
+            preview.className = '';
+            preview.innerHTML = h;
+            var shareBtn = E('btnShareCurrentAlias');
+            if(shareBtn) shareBtn.onclick = function(){ openShareModal(m.hme_alias||''); };
+            var body = E('localPreviewBody');
+            if(m.html){
+                var iframe = document.createElement('iframe');
+                iframe.sandbox = 'allow-popups';
+                iframe.srcdoc = m.html;
+                body.innerHTML = '';
+                body.appendChild(iframe);
+                iframe.onload = function(){ setTimeout(function(){ try{ iframe.style.height=(iframe.contentDocument.documentElement.scrollHeight+20)+'px'; }catch(e){ iframe.style.height='600px'; } },120); };
+            }else{
+                body.innerHTML = '<pre>'+esc(m.text||'(无正文)')+'</pre>';
+            }
+        }
+
+        function openShareModal(alias){
+            var row = localAliases.find(function(a){return a.alias===alias}) || {alias:alias};
+            var h = '<div class="modal-overlay" id="shareModal" onclick="if(event.target===this)closeShareModal()"><div class="modal-box"><h3><i class="diamond"></i> 分配 / 分享收件箱</h3>'
+              + '<p>隐私邮箱: <b>'+esc(alias)+'</b><br>分享链接是只读访问，只能看到这个隐私邮箱的邮件。</p>'
+              + '<input type="hidden" id="shareAlias" value="'+escAttr(alias)+'">'
+              + '<input type="hidden" id="shareAccountId" value="'+escAttr(row.account_id||localSelectedAccount||'')+'">'
+              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">分配给</label><input type="text" id="shareAssignee" value="'+escAttr(row.assignee||'')+'" placeholder="例如 张三 / 客户A">'
+              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">备注</label><input type="text" id="shareNote" value="'+escAttr(row.note||'')+'" placeholder="可选">'
+              + '<label style="display:flex;gap:8px;align-items:center;margin-top:8px;font-size:13px"><input type="checkbox" id="shareEnabled" '+(row.share_enabled?'checked':'')+'> 启用分享链接</label>'
+              + (row.share_url?'<div style="margin-top:8px;font-size:11px;word-break:break-all;color:var(--ink-faint)">当前链接: <code>'+esc(row.share_url)+'</code></div>':'')
+              + '<div class="modal-actions"><button class="btn btn-outline" onclick="closeShareModal()">取消</button><button class="btn btn-outline" onclick="saveShare(true)">重置链接</button><button class="btn btn-primary" onclick="saveShare(false)">保存</button></div><div class="modal-msg" id="shareMsg"></div></div></div>';
+            document.body.insertAdjacentHTML('beforeend', h);
+        }
+
+        function closeShareModal(){ var m=E('shareModal'); if(m) m.remove(); }
+
+        async function saveShare(regenerate){
+            var payload = {
+                alias: E('shareAlias').value,
+                account_id: ((E('shareAccountId')||{}).value || localSelectedAccount || ''),
+                assignee: E('shareAssignee').value.trim(),
+                note: E('shareNote').value.trim(),
+                enabled: !!E('shareEnabled').checked,
+                regenerate: !!regenerate
+            };
+            var d = await api('/api/local-inbox/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            if(!d.ok){ E('shareMsg').innerHTML = '<span style="color:var(--red)">'+esc(d.error||'保存失败')+'</span>'; return; }
+            var link = d.share.share_url || '';
+            E('shareMsg').innerHTML = '<span style="color:var(--green)">已保存</span>'+(link?'<div style="word-break:break-all;margin-top:6px"><code>'+esc(link)+'</code></div>':'');
+            if(link) navigator.clipboard.writeText(link).then(function(){ toast('分享链接已复制'); });
+            await refreshLocalInbox(true);
+        }
+
+        async function openWorkerConfig(){
+            var d = await api('/api/inbound-config');
+            if(!d.ok){ toast('读取配置失败',true); return; }
+            var code = 'INBOUND_URL='+d.inbound_url+'\nINBOUND_TOKEN='+d.token+'\nWorker 模板: '+d.worker_template;
+            window._workerConfigText = code;
+            var h = '<div class="modal-overlay" id="workerModal" onclick="if(event.target===this)closeWorkerModal()"><div class="modal-box"><h3><i class="diamond"></i> Cloudflare Email Worker 配置</h3>'
+              + '<p>Cloudflare Email Routing 已将 <b>inbox@mail.armsg.yueseng-ys.com</b> 路由到 Worker；这里保留配置方便排查。</p>'
+              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">INBOUND_URL</label><input type="text" readonly value="'+escAttr(d.inbound_url)+'">'
+              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">INBOUND_TOKEN</label><input type="text" readonly value="'+escAttr(d.token)+'">'
+              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">Worker 模板</label><input type="text" readonly value="'+escAttr(d.worker_template)+'">'
+              + '<div style="font-size:11px;color:var(--ink-faint);margin-top:8px">当前本机收件: '+(d.stats.total_mails||0)+' 封 / '+(d.stats.alias_count||0)+' 个邮箱。</div>'
+              + '<div class="modal-actions"><button class="btn btn-outline" onclick="closeWorkerModal()">关闭</button><button class="btn btn-outline" onclick="regenerateInboundToken()">重置 Token</button><button class="btn btn-primary" onclick="copyWorkerConfig()">复制配置</button></div></div></div>';
+            document.body.insertAdjacentHTML('beforeend', h);
+        }
+
+        function closeWorkerModal(){ var m=E('workerModal'); if(m) m.remove(); }
+
+        function copyWorkerConfig(){ navigator.clipboard.writeText(window._workerConfigText||'').then(function(){toast('配置已复制')}); }
+
+        async function regenerateInboundToken(){
+            if(!confirm('确认重置 INBOUND_TOKEN？\n重置后 Cloudflare Worker 必须同步更新，否则无法投递邮件。')) return;
+            var d = await api('/api/inbound-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({regenerate_token:true})});
+            if(d.ok){ closeWorkerModal(); openWorkerConfig(); toast('Token 已重置'); }
+            else toast('重置失败',true);
+        }
+
         var _inboxBusy = false;
         var _inboxSse = null;
         var _inboxStreamMsgs = [];
@@ -1501,20 +2827,88 @@ UI_HTML = r"""<!DOCTYPE html>
             var d = await api('/api/accounts/'+encodeURIComponent(accId)+'/validate',{method:'POST'});
             if(d.ok) toast('校验通过: '+d.real_email);
             else toast('校验失败: '+(d.error||'?'),true);
+            forwardOptions.loaded = false;
             refreshAll();
         }
         
         async function removeAccount(accId){
-            if(!confirm('确认删除该账号？')) return;
+            var acc = accounts.find(function(a){return a.id===accId});
+            var name = acc?(acc.name||acc.real_email||accId):accId;
+            if(!confirm('确认删除账号「'+name+'」？\\n\\n只会删除本面板保存的 Cookie 和账号配置，不会删除 iCloud 里已经创建的隐私邮箱。')) return;
             var d = await api('/api/accounts/'+encodeURIComponent(accId)+'/remove',{method:'POST'});
             if(d.ok) toast('已删除');
+            else toast('删除失败',true);
+            forwardOptions.loaded = false;
             refreshAll();
+        }
+
+        function showUpdateCookieModal(accId){
+            var acc = accounts.find(function(a){return a.id===accId});
+            if(!acc){ toast('账号不存在',true); return; }
+            var h = '<div class="modal-overlay" id="updCookieModal" onclick="if(event.target===this)closeUpdateCookieModal()"><div class="modal-box"><h3><i class="diamond"></i> 更新 iCloud Cookie</h3><p>账号: <b>'+esc(acc.name||acc.real_email||accId)+'</b><br>请在浏览器重新登录 icloud.com、完成 2FA 并选择信任此浏览器，然后用 Cookie Editor 导出 Header String 粘贴到这里。</p><input type="hidden" id="updAccId" value="'+escAttr(accId)+'"><input type="text" id="updAccNameInput" value="'+escAttr(acc.name||'')+'" placeholder="账号名称"><textarea id="updCookieInput" placeholder="粘贴新的 Cookie Header String 或 JSON"></textarea><div class="modal-actions"><button class="btn btn-outline" onclick="closeUpdateCookieModal()">取消</button><button class="btn btn-primary" id="btnUpdateCookie" onclick="updateAccountCookie()">保存并校验</button></div><div class="modal-msg" id="updCookieMsg"></div></div></div>';
+            document.body.insertAdjacentHTML('beforeend',h);
+        }
+
+        function closeUpdateCookieModal(){
+            var m = E('updCookieModal');
+            if(m) m.remove();
+        }
+
+        async function updateAccountCookie(){
+            var accId = E('updAccId').value;
+            var name = E('updAccNameInput').value.trim();
+            var cookies = E('updCookieInput').value.trim();
+            if(!cookies){ E('updCookieMsg').innerHTML = '<span style="color:var(--red)">请粘贴新的 Cookie</span>'; return; }
+            var btn = E('btnUpdateCookie');
+            btn.disabled = true;
+            btn.textContent = '校验中...';
+            var d = await api('/api/accounts/'+encodeURIComponent(accId)+'/cookies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,cookie_input:cookies})});
+            btn.disabled = false;
+            btn.textContent = '保存并校验';
+            if(d.ok){
+                E('updCookieMsg').innerHTML = '<span style="color:var(--green)">更新成功! '+esc(d.real_email||'')+' ('+(d.alias_total||0)+' 别名)</span>';
+                toast('Cookie 已更新');
+                setTimeout(closeUpdateCookieModal,1200);
+                forwardOptions.loaded = false;
+                refreshAll();
+            } else {
+                E('updCookieMsg').innerHTML = '<span style="color:var(--red)">'+esc(d.error||'更新失败')+'</span>';
+            }
         }
         
         async function toggleScheduler(){
             var act = state.running?'stop':'start';
-            var d = await api('/api/scheduler/'+act,{method:'POST'});
+            var opts = {method:'POST'};
+            if(act==='start'){
+                opts.headers = {'Content-Type':'application/json'};
+                opts.body = JSON.stringify(collectSchedulerConfig());
+            }
+            var d = await api('/api/scheduler/'+act,opts);
             if(d.ok) toast(state.running?'调度器已停止':'调度器已启动');
+            else toast(d.error||'操作失败',true);
+            refreshAll();
+        }
+
+        async function saveSchedulerConfig(){
+            var d = await api('/api/scheduler/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectSchedulerConfig())});
+            if(d.ok) toast('计划已保存');
+            else toast('保存失败: '+(d.error||'?'),true);
+            refreshAll();
+        }
+
+        async function saveAppSettings(){
+            var payload = {
+                alias_split_enabled: !!(E('aliasSplitEnabled')&&E('aliasSplitEnabled').checked),
+                alias_split_count: Math.max(1, Math.min(20, parseInt((E('aliasSplitCount')||{}).value||'4',10)||4)),
+                forward_to_email: ((E('forwardToEmail')||{}).value||'').trim()
+            };
+            var d = await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            if(d.ok){
+                if(d.forward_update && d.forward_update.ok) toast('全局设置已保存，Apple 转发地址已同步');
+                else if(d.forward_update && !d.forward_update.ok) toast('全局设置已保存，但 Apple 转发同步失败', true);
+                else toast('全局设置已保存');
+            }
+            else toast('保存失败: '+(d.error||'?'),true);
             refreshAll();
         }
         
@@ -1542,6 +2936,10 @@ UI_HTML = r"""<!DOCTYPE html>
             a.href = URL.createObjectURL(b);
             a.download = 'icloud_aliases.csv';
             a.click();
+        }
+
+        function exportCredentials(){
+            window.open('/admin/export_credentials.csv','_blank');
         }
         
         function clearLogs(){
@@ -1619,6 +3017,7 @@ UI_HTML = r"""<!DOCTYPE html>
             if(d.ok){
                 E('addAccMsg').innerHTML = '<span style="color:var(--green)">添加成功! '+esc(d.real_email||'')+' ('+(d.alias_total||0)+' 别名)</span>';
                 setTimeout(closeAddAccModal,1500);
+                forwardOptions.loaded = false;
                 refreshAll();
             } else {
                 E('addAccMsg').innerHTML = '<span style="color:var(--red)">'+esc(d.error||'失败')+'</span>';
@@ -1631,15 +3030,19 @@ UI_HTML = r"""<!DOCTYPE html>
                 {title:'账号管理',items:[
                     {method:'GET',path:'/api/accounts',desc:'列出所有账号（脱敏，不含 cookie）'},
                     {method:'POST',path:'/api/accounts/add',desc:'添加账号',body:'{"name":"账号名","cookie_input":"name1=value1; name2=value2"}'},
+                    {method:'POST',path:'/api/accounts/{id}/cookies',desc:'重新导入指定账号 Cookie 并校验',body:'{"name":"账号名","cookie_input":"name1=value1; name2=value2"}'},
                     {method:'POST',path:'/api/accounts/{id}/remove',desc:'删除账号'},
                     {method:'POST',path:'/api/accounts/{id}/validate',desc:'重新校验账号会话'}
                 ]},
                 {title:'状态',items:[
-                    {method:'GET',path:'/api/state',desc:'全局状态 + 账号汇总'}
+                    {method:'GET',path:'/api/state',desc:'全局状态 + 账号汇总'},
+                    {method:'GET',path:'/api/settings',desc:'读取全局邮箱设置'},
+                    {method:'GET',path:'/api/forward-options',desc:'读取 Apple 账号已绑定/允许的转发邮箱选项'},
+                    {method:'POST',path:'/api/settings',desc:'保存分裂开关和转发地址选择',body:'{"alias_split_enabled":true,"alias_split_count":4,"forward_to_email":"user@example.com"}'}
                 ]},
                 {title:'别名 / 邮箱',items:[
-                    {method:'GET',path:'/api/aliases',desc:'所有账号的别名列表（iCloud API 实时拉取）'},
-                    {method:'GET',path:'/api/emails',desc:'本地创建记录（latest_emails.txt，永远可用）'},
+                    {method:'GET',path:'/api/aliases',desc:'所有账号的别名列表（iCloud API 实时拉取，并写入云端同步缓存，支持派生地址）'},
+                    {method:'GET',path:'/api/emails',desc:'本地创建记录 + 最近一次云端同步缓存，支持派生地址'},
                     {method:'POST',path:'/api/accounts/{id}/create',desc:'为指定账号创建别名',body:'{"count":5,"label":"可选标签"}'},
                     {method:'POST',path:'/api/create-batch',desc:'跨账号批量创建',body:'{"account_ids":["id1","id2"],"count_per_account":5}'}
                 ]},
@@ -1649,12 +3052,22 @@ UI_HTML = r"""<!DOCTYPE html>
                     {method:'GET',path:'/api/accounts/{id}/mail/{别名邮箱}',desc:'查指定隐私邮箱的收件'},
                     {method:'POST',path:'/api/accounts/{id}/app-password',desc:'设置 App 专用密码并测试 IMAP',body:'{"app_password":"xxxx-xxxx-xxxx-xxxx","icloud_email":"xxx@icloud.com"}'}
                 ]},
+                {title:'本机收件箱 / 分享',items:[
+                    {method:'GET',path:'/api/inbound-config',desc:'读取 Cloudflare Email Worker 投递地址和 token'},
+                    {method:'POST',path:'/api/inbound-mail',desc:'Cloudflare Worker 投递原始邮件（Bearer token 认证）',body:'{"from":"sender@example.com","to":"inbox@mail.example.com","raw":"完整 RFC822 邮件","headers":{}}'},
+                    {method:'GET',path:'/api/local-inbox/summary',desc:'按隐私邮箱统计本机收到的邮件，并返回分享状态'},
+                    {method:'GET',path:'/api/local-inbox/messages?alias=xxx@icloud.com',desc:'查看某个隐私邮箱的独立收件箱'},
+                    {method:'POST',path:'/api/local-inbox/share',desc:'给某个隐私邮箱分配负责人并生成只读分享链接',body:'{"alias":"xxx@icloud.com","assignee":"客户A","enabled":true}'},
+                    {method:'GET',path:'/share/{token}',desc:'外部分发人员只读分享页面'}
+                ]},
                 {title:'快捷入口',items:[
                     {method:'GET',path:'/api/mail?email=user@icloud.com',desc:'按主邮箱查所有别名收件'},
                     {method:'GET',path:'/api/mail?email=...&alias=xxx@icloud.com',desc:'按主邮箱查指定别名收件'}
                 ]},
                 {title:'调度器',items:[
-                    {method:'POST',path:'/api/scheduler/start',desc:'启动定时调度器'},
+                    {method:'GET',path:'/api/scheduler/config',desc:'读取当前计划任务配置'},
+                    {method:'POST',path:'/api/scheduler/config',desc:'保存计划任务配置',body:'{"mode":"interval","interval_minutes":30,"count_per_run":1}'},
+                    {method:'POST',path:'/api/scheduler/start',desc:'按当前配置启动定时调度器'},
                     {method:'POST',path:'/api/scheduler/stop',desc:'停止调度器'}
                 ]},
                 {title:'实时日志',items:[
@@ -1738,28 +3151,672 @@ UI_HTML = r"""<!DOCTYPE html>
 </html>
 """
 
+SHARED_INBOX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shared Inbox</title>
+  <style>
+    :root{--paper:#f7f4ef;--ink:#151515;--muted:#777;--rule:#ddd4c8;--red:#b23a35}
+    body{margin:0;background:var(--paper);color:var(--ink);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    header{padding:18px 22px;border-bottom:1px solid var(--rule);display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
+    h1{font-size:18px;margin:0 0 6px}
+    .sub{font-size:12px;color:var(--muted)}
+    main{max-width:1080px;margin:0 auto;padding:18px}
+    button{font-family:inherit;border:1px solid var(--ink);background:var(--ink);color:var(--paper);padding:7px 14px;cursor:pointer}
+    button.out{background:transparent;color:var(--ink);border-color:var(--rule)}
+    .card{border:1px solid var(--rule);background:#fff;margin-bottom:10px}
+    .row{padding:12px 14px;border-bottom:1px solid var(--rule);cursor:pointer}
+    .row:hover{background:#faf8f5}
+    .subject{font-weight:700;margin-bottom:4px}
+    .meta{font-size:12px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap}
+    .body{display:none;padding:14px;border-top:1px solid var(--rule);max-height:620px;overflow:auto;background:#fff}
+    iframe{width:100%;border:0;background:white;min-height:220px}
+    pre{white-space:pre-wrap;word-break:break-word;margin:0}
+    .empty{padding:60px;text-align:center;color:var(--muted);border:1px solid var(--rule);background:#fff}
+    .pager{display:flex;justify-content:center;align-items:center;gap:12px;margin:16px}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="title">Shared Inbox</h1>
+      <div class="sub" id="subtitle">加载中...</div>
+    </div>
+    <button class="out" onclick="loadMessages()">刷新</button>
+  </header>
+  <main>
+    <div id="list" class="empty">加载中...</div>
+    <div class="pager" id="pager" style="display:none">
+      <button class="out" onclick="page(-1)">上一页</button>
+      <span id="pageInfo"></span>
+      <button class="out" onclick="page(1)">下一页</button>
+    </div>
+  </main>
+  <script>
+    const TOKEN = {{ token|tojson }};
+    let offset = 0, limit = 30, total = 0, expanded = null;
+    const E = id => document.getElementById(id);
+    const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    async function api(path){ const r = await fetch(path); return await r.json(); }
+    async function loadMessages(){
+      E('list').innerHTML = '<div class="empty">加载中...</div>';
+      const d = await api('/api/shared/'+encodeURIComponent(TOKEN)+'/messages?limit='+limit+'&offset='+offset);
+      if(!d.ok){ E('list').innerHTML = '<div class="empty">'+esc(d.error||'加载失败')+'</div>'; return; }
+      total = d.count || 0;
+      const share = d.share || {};
+      E('title').textContent = share.alias || 'Shared Inbox';
+      E('subtitle').textContent = (share.assignee?('分配给: '+share.assignee+' · '):'') + (share.note||'只读收件箱');
+      const msgs = d.messages || [];
+      if(!msgs.length){ E('list').innerHTML = '<div class="empty">暂无邮件</div>'; E('pager').style.display='none'; return; }
+      E('list').className = 'card';
+      E('list').innerHTML = msgs.map(m => (
+        '<div class="row" onclick="toggleMsg('+m.id+')">'+
+        '<div class="subject">'+esc(m.subject||'(无主题)')+'</div>'+
+        '<div class="meta"><span>From: '+esc(m.from||m.sender_name||'')+'</span><span>'+esc((m.created_at||'').substring(0,19))+'</span></div>'+
+        '<div class="body" id="body_'+m.id+'">加载中...</div></div>'
+      )).join('');
+      E('pager').style.display = total > limit ? 'flex' : 'none';
+      E('pageInfo').textContent = (offset+1)+' - '+Math.min(offset+limit,total)+' / '+total;
+    }
+    function page(delta){ offset = Math.max(0, offset + delta*limit); if(offset >= total) offset = Math.max(0, total - limit); loadMessages(); }
+    async function toggleMsg(id){
+      if(expanded && expanded !== id){ const old=E('body_'+expanded); if(old) old.style.display='none'; }
+      const el = E('body_'+id); if(!el) return;
+      if(el.style.display==='block'){ el.style.display='none'; expanded=null; return; }
+      el.style.display='block'; expanded=id;
+      if(el.dataset.loaded) return;
+      const d = await api('/api/shared/'+encodeURIComponent(TOKEN)+'/messages/'+id);
+      if(!d.ok || !d.message){ el.innerHTML = esc(d.error||'加载失败'); return; }
+      const m = d.message;
+      if(m.html){
+        const iframe = document.createElement('iframe');
+        iframe.sandbox = 'allow-popups';
+        iframe.srcdoc = m.html;
+        el.innerHTML = '';
+        el.appendChild(iframe);
+        iframe.onload = () => setTimeout(()=>{ try{ iframe.style.height=(iframe.contentDocument.documentElement.scrollHeight+20)+'px'; }catch(e){ iframe.style.height='520px'; }},120);
+      }else{
+        el.innerHTML = '<pre>'+esc(m.text||'(无正文)')+'</pre>';
+      }
+      el.dataset.loaded = '1';
+    }
+    loadMessages();
+  </script>
+</body>
+</html>
+"""
+
+ADMIN_LOGIN_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Login · iCloud HME Mail</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f4ef;color:#151515;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.box{width:min(440px,92vw);background:#fff;border:1px solid #d8d0c4;box-shadow:10px 10px 0 #151515;padding:28px}
+h1{margin:0 0 8px;font-size:22px}.sub{font-size:12px;color:#777;margin-bottom:22px}
+input,button{width:100%;box-sizing:border-box;font:inherit;padding:12px;border:1px solid #151515;margin-top:10px}
+button{background:#151515;color:#f7f4ef;cursor:pointer}.err{color:#b23a35;font-size:12px;margin-top:10px;min-height:18px}
+a{color:#151515}
+</style></head><body>
+<div class="box">
+  <h1>iCloud Mail Admin</h1>
+  <div class="sub">管理员登录后进入 iCloud 隐私邮箱创建、调度、本机收件箱和凭证管理界面。</div>
+  <input id="pwd" type="password" placeholder="管理员密码" autofocus onkeydown="if(event.key==='Enter')login()">
+  <button onclick="login()">登录管理后台</button>
+  <div class="err" id="msg"></div>
+  <div class="sub" style="margin-top:18px">个人收件入口：<a href="/user">/user</a></div>
+</div>
+<script>
+async function sha256(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function login(){
+  const raw=document.getElementById('pwd').value;
+  const password=await sha256(raw);
+  const r=await fetch('/open_api/admin_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
+  if(r.ok){localStorage.setItem('cf_admin_auth',password); location.href='/'; return;}
+  document.getElementById('msg').textContent=await r.text()||'登录失败';
+}
+</script></body></html>"""
+
+USER_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>My Inbox · iCloud HME Mail</title>
+<style>
+:root{--paper:#f7f4ef;--ink:#151515;--muted:#777;--rule:#ddd4c8;--blue:#2463eb;--red:#b23a35;--green:#18864b}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{height:58px;display:flex;justify-content:space-between;align-items:center;padding:0 18px;border-bottom:1px solid var(--rule);background:#fff}
+h1{font-size:18px;margin:0}.wrap{display:grid;grid-template-columns:320px 1fr 1.2fr;min-height:calc(100vh - 58px)}
+.pane{border-right:1px solid var(--rule);overflow:auto}.pane:last-child{border-right:0}.pad{padding:14px}
+.card{background:#fff;border:1px solid var(--rule);padding:14px;margin-bottom:12px}
+.muted{color:var(--muted);font-size:12px}.title{font-weight:800}.row{padding:11px 12px;border-bottom:1px solid var(--rule);cursor:pointer;background:#fff}.row:hover,.row.active{background:#f0ebe4}
+input,button,select{font:inherit;border:1px solid var(--ink);padding:9px;background:#fff}button{background:var(--ink);color:var(--paper);cursor:pointer}.out{background:#fff;color:var(--ink);border-color:var(--rule)}
+.grid{display:grid;gap:8px}.tabs{display:flex;gap:8px;margin-bottom:10px}.tabs button{flex:1}.hidden{display:none}.msg{font-size:12px;min-height:18px}.err{color:var(--red)}.ok{color:var(--green)}
+.body{background:#fff;border:1px solid var(--rule);padding:14px;min-height:260px}iframe{width:100%;border:0;background:#fff;min-height:300px}pre{white-space:pre-wrap;word-break:break-word}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}.pane{border-right:0;border-bottom:1px solid var(--rule);max-height:none}}
+</style></head><body>
+<header><h1>My Inbox</h1><div><button class="out" onclick="logout()">退出</button></div></header>
+<div class="wrap">
+  <aside class="pane"><div class="pad">
+    <div class="card">
+      <div class="tabs"><button class="out" onclick="mode('cred')">凭证登录</button><button class="out" onclick="mode('user')">用户登录</button></div>
+      <div id="credBox" class="grid">
+        <div class="muted">粘贴管理员导出的地址 JWT，可直接查看该隐私邮箱收件箱。</div>
+        <input id="credential" placeholder="Address JWT / 邮箱凭证">
+        <button onclick="credentialLogin()">进入邮箱</button>
+      </div>
+      <div id="userBox" class="grid hidden">
+        <input id="email" placeholder="用户邮箱">
+        <input id="password" type="password" placeholder="密码">
+        <div style="display:flex;gap:8px"><button style="flex:1" onclick="userLogin()">登录</button><button class="out" style="flex:1" onclick="userRegister()">注册</button></div>
+        <input id="bindCredential" placeholder="绑定地址 JWT，可选">
+        <button class="out" onclick="bindCredential()">绑定凭证到当前用户</button>
+      </div>
+      <div class="msg" id="loginMsg"></div>
+    </div>
+    <div class="card"><div class="title">地址</div><div class="muted" id="addrHint">未登录</div></div>
+    <div id="addresses"></div>
+  </div></aside>
+  <main class="pane"><div class="pad">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div class="title">邮件</div><button class="out" onclick="loadMails()">刷新</button></div>
+    <div id="mails" class="card muted">请选择地址</div>
+  </div></main>
+  <section class="pane"><div class="pad">
+    <div class="title" id="subject">预览</div><div class="muted" id="meta">选择邮件查看正文</div><div class="body" id="body">暂无</div>
+  </div></section>
+</div>
+<script>
+let addressJwt=localStorage.getItem('address_jwt')||'', userJwt=localStorage.getItem('user_jwt')||'', currentAddress='', currentUserAddresses=[];
+const E=id=>document.getElementById(id); const esc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function sha256(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+function mode(m){E('credBox').classList.toggle('hidden',m!=='cred');E('userBox').classList.toggle('hidden',m!=='user')}
+function setMsg(t,err){E('loginMsg').textContent=t;E('loginMsg').className='msg '+(err?'err':'ok')}
+async function credentialLogin(){
+  const jwt=(E('credential').value||addressJwt).trim(); if(!jwt){setMsg('请粘贴凭证',true);return}
+  const r=await fetch('/open_api/credential_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credential:jwt})});
+  if(!r.ok){setMsg(await r.text()||'凭证无效',true);return}
+  addressJwt=jwt; localStorage.setItem('address_jwt',jwt); await loadAddressSettings();
+}
+async function loadAddressSettings(){
+  const r=await fetch('/api/settings',{headers:{Authorization:'Bearer '+addressJwt}}); if(!r.ok){setMsg('凭证过期或无效',true);return}
+  const d=await r.json(); currentAddress=d.address; currentUserAddresses=[{name:d.address,id:d.address_id||0,mail_count:0}]; renderAddresses(currentUserAddresses); setMsg('已进入 '+d.address,false); loadMails();
+}
+async function userRegister(){
+  const password=await sha256(E('password').value); const email=E('email').value.trim();
+  const r=await fetch('/user_api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+  if(!r.ok){setMsg(await r.text()||'注册失败',true);return} setMsg('注册成功，请登录',false);
+}
+async function userLogin(){
+  const password=await sha256(E('password').value); const email=E('email').value.trim();
+  const r=await fetch('/user_api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+  if(!r.ok){setMsg(await r.text()||'登录失败',true);return}
+  const d=await r.json(); userJwt=d.jwt; localStorage.setItem('user_jwt',userJwt); setMsg('用户登录成功',false); await loadUserAddresses();
+}
+async function bindCredential(){
+  if(!userJwt){setMsg('请先用户登录',true);return}
+  const jwt=E('bindCredential').value.trim(); if(!jwt){setMsg('请粘贴地址凭证',true);return}
+  const r=await fetch('/user_api/bind_address',{method:'POST',headers:{'x-user-token':userJwt,Authorization:'Bearer '+jwt}});
+  if(!r.ok){setMsg(await r.text()||'绑定失败',true);return} setMsg('绑定成功',false); loadUserAddresses();
+}
+async function loadUserAddresses(){
+  const r=await fetch('/user_api/bind_address',{headers:{'x-user-token':userJwt}}); if(!r.ok){setMsg('用户登录过期',true);return}
+  const d=await r.json(); currentUserAddresses=d.results||[]; renderAddresses(currentUserAddresses);
+}
+function renderAddresses(list){
+  E('addrHint').textContent=list.length+' 个地址';
+  E('addresses').innerHTML=list.map(a=>{
+    const name=a.name||a.address||'';
+    return '<div class="row" data-address="'+esc(name)+'"><div class="title">'+esc(name)+'</div><div class="muted">'+(a.mail_count||0)+' mails</div></div>';
+  }).join('')||'<div class="card muted">没有绑定地址</div>';
+  Array.from(E('addresses').querySelectorAll('.row[data-address]')).forEach(el=>el.onclick=()=>selectAddress(el.dataset.address));
+  if(list.length&&!currentAddress) currentAddress=list[0].name||list[0].address;
+}
+function selectAddress(a){currentAddress=a; loadMails();}
+async function loadMails(){
+  E('mails').innerHTML='加载中...'; let r;
+  if(userJwt){r=await fetch('/user_api/mails?address='+encodeURIComponent(currentAddress||'')+'&limit=50&offset=0',{headers:{'x-user-token':userJwt}})}
+  else if(addressJwt){r=await fetch('/api/parsed_mails?limit=50&offset=0',{headers:{Authorization:'Bearer '+addressJwt}})}
+  else {E('mails').innerHTML='请先登录';return}
+  if(!r.ok){E('mails').innerHTML='加载失败';return}
+  const d=await r.json(), rows=d.results||[]; E('mails').className='';
+  E('mails').innerHTML=rows.map(m=>'<div class=\"row\" onclick=\"showMail('+m.id+')\"><div class=\"title\">'+esc(m.subject||'(无主题)')+'</div><div class=\"muted\">'+esc(m.sender||m.from||'')+' · '+esc((m.created_at||'').substring(0,19))+'</div></div>').join('')||'<div class=\"card muted\">暂无邮件</div>';
+}
+async function showMail(id){
+  let r;if(userJwt){r=await fetch('/user_api/parsed_mail/'+id,{headers:{'x-user-token':userJwt}})}else{r=await fetch('/api/parsed_mail/'+id,{headers:{Authorization:'Bearer '+addressJwt}})}
+  if(!r.ok){E('body').textContent='加载失败';return}
+  const m=await r.json(); if(!m){E('body').textContent='邮件不存在';return}
+  E('subject').textContent=m.subject||'(无主题)'; E('meta').textContent=(m.sender||m.from||'')+' · '+(m.created_at||'');
+  if(m.html){const iframe=document.createElement('iframe'); iframe.sandbox='allow-popups'; iframe.srcdoc=m.html; E('body').innerHTML=''; E('body').appendChild(iframe); iframe.onload=()=>setTimeout(()=>{try{iframe.style.height=(iframe.contentDocument.documentElement.scrollHeight+20)+'px'}catch(e){}},120)}
+  else E('body').innerHTML='<pre>'+esc(m.text||m.raw||'(无正文)')+'</pre>';
+}
+function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem('user_jwt');location.reload()}
+(async()=>{if(userJwt){mode('user');await loadUserAddresses()}else if(addressJwt){await loadAddressSettings()}})();
+</script></body></html>"""
+
 # ----- Flask Routes -----
+
+@app.route("/admin")
+def admin_login_page():
+    if _admin_auth_ok():
+        return _maybe_set_admin_cookie(make_response(render_template_string(UI_HTML)))
+    return render_template_string(ADMIN_LOGIN_HTML)
+
+@app.route("/user")
+def user_inbox_page():
+    return render_template_string(USER_HTML)
+
+@app.route("/login")
+def login_page():
+    return redirect("/admin")
+
+@app.route("/logout")
+def logout_page():
+    resp = make_response(redirect("/admin"))
+    resp.delete_cookie("cf_admin_auth")
+    resp.delete_cookie("cf_user_token")
+    return resp
 
 @app.route("/")
 @app.route("/index.html")
-def index(): return render_template_string(UI_HTML)
+def index(): return _maybe_set_admin_cookie(make_response(render_template_string(UI_HTML)))
+
+# ----- Cloudflare Temp Email compatible open/user/address/admin APIs -----
+
+@app.route("/open_api/settings")
+def open_api_settings():
+    return jsonify({
+        "title": "iCloud HME Mail",
+        "announcement": "iCloud Hide My Email + local inbox",
+        "prefix": "",
+        "addressRegex": "",
+        "minAddressLen": 1,
+        "maxAddressLen": 64,
+        "defaultDomains": ["icloud.com"],
+        "domains": ["icloud.com"],
+        "needAuth": False,
+        "enableUserCreateEmail": False,
+        "disableAnonymousUserCreateEmail": True,
+        "disableCustomAddressName": True,
+        "enableUserDeleteEmail": True,
+        "enableAddressPassword": True,
+        "enableAgentEmailInfo": True,
+        "version": "icloud-hme-cf-compat",
+    })
+
+@app.route("/open_api/admin_login", methods=["POST"])
+def open_api_admin_login():
+    data = request.get_json(silent=True) or {}
+    password = str(data.get("password") or "")
+    if not _cf_store.verify_admin_secret(password):
+        return Response("NeedAdminPasswordMsg", status=401)
+    cookie_value = _cf_store.admin_cookie_value(password)
+    resp = jsonify({"success": True})
+    resp.set_cookie("cf_admin_auth", cookie_value, max_age=30*24*3600, httponly=False, secure=True, samesite="Lax")
+    return resp
+
+@app.route("/open_api/site_login", methods=["POST"])
+def open_api_site_login():
+    return jsonify({"success": True})
+
+@app.route("/open_api/credential_login", methods=["POST"])
+def open_api_credential_login():
+    data = request.get_json(silent=True) or {}
+    credential = str(data.get("credential") or "")
+    try:
+        _sync_cf_addresses()
+        _cf_store.verify_address_token(credential)
+        return jsonify({"success": True})
+    except Exception:
+        return Response("InvalidAddressCredentialMsg", status=401)
+
+@app.route("/user_api/open_settings")
+def user_api_open_settings():
+    return jsonify({
+        "enable": True,
+        "enableMailVerify": False,
+        "enableMailAllowList": False,
+        "enableEmailCheckRegex": False,
+    })
+
+@app.route("/user_api/register", methods=["POST"])
+def user_api_register():
+    data = request.get_json(silent=True) or {}
+    try:
+        _cf_store.create_user(data.get("email", ""), data.get("password", ""))
+        return jsonify({"success": True})
+    except sqlite3.IntegrityError:
+        return Response("UserAlreadyExistsMsg", status=400)
+    except Exception as e:
+        return Response(str(e), status=400)
+
+@app.route("/user_api/login", methods=["POST"])
+def user_api_login():
+    data = request.get_json(silent=True) or {}
+    user = _cf_store.verify_user(data.get("email", ""), data.get("password", ""))
+    if not user:
+        return Response("InvalidEmailOrPasswordMsg", status=400)
+    token = _cf_store.user_token(user)
+    resp = jsonify({"jwt": token})
+    resp.set_cookie("cf_user_token", token, max_age=30*24*3600, httponly=False, secure=True, samesite="Lax")
+    return resp
+
+@app.route("/user_api/settings")
+def user_api_settings():
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    return jsonify({"user_email": user.get("user_email"), "user_id": user.get("user_id"), "role": user.get("role", "user")})
+
+@app.route("/user_api/bind_address", methods=["GET", "POST"])
+def user_api_bind_address():
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    if request.method == "GET":
+        return jsonify({"results": _cf_store.list_user_addresses(user.get("user_id"))})
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    _cf_store.bind_user_address(user.get("user_id"), payload.get("address_id"))
+    return jsonify({"success": True})
+
+@app.route("/user_api/bind_address_jwt/<int:address_id>")
+def user_api_bind_address_jwt(address_id):
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    allowed = {int(a.get("id")) for a in _cf_store.list_user_addresses(user.get("user_id"))}
+    if int(address_id) not in allowed:
+        return Response("AddressNotBindedMsg", status=400)
+    return jsonify({"jwt": _cf_store.address_token(address_id=address_id)})
+
+@app.route("/user_api/unbind_address", methods=["POST"])
+def user_api_unbind_address():
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    data = request.get_json(silent=True) or {}
+    _cf_store.unbind_user_address(user.get("user_id"), data.get("address_id"))
+    return jsonify({"success": True})
+
+@app.route("/user_api/mails")
+def user_api_mails():
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    address = norm_email(request.args.get("address", ""))
+    bound = _cf_store.list_user_addresses(user.get("user_id"))
+    addresses = [a["name"] for a in bound]
+    if address:
+        addresses = [a for a in addresses if a == address]
+    return jsonify(_list_cf_mails(addresses, request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=True, parsed=True))
+
+@app.route("/user_api/parsed_mail/<int:mail_id>")
+def user_api_parsed_mail(mail_id):
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    addresses = [a["name"] for a in _cf_store.list_user_addresses(user.get("user_id"))]
+    msg = _get_cf_mail(mail_id, addresses, include_raw=False, parsed=True)
+    return jsonify(msg)
+
+@app.route("/user_api/mails/<int:mail_id>", methods=["DELETE"])
+def user_api_delete_mail(mail_id):
+    user = _user_payload_or_none()
+    if not user:
+        return Response("UserTokenExpiredMsg", status=401)
+    addresses = [a["name"] for a in _cf_store.list_user_addresses(user.get("user_id"))]
+    msg = _get_cf_mail(mail_id, addresses, include_raw=False)
+    if not msg:
+        return jsonify({"success": False})
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        cur = conn.execute("DELETE FROM inbound_mails WHERE id=?", (int(mail_id),))
+    return jsonify({"success": cur.rowcount > 0})
+
+@app.route("/api/mails")
+def cf_api_mails():
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    return jsonify(_list_cf_mails([payload["address"]], request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=True))
+
+@app.route("/api/mail/<int:mail_id>")
+def cf_api_mail(mail_id):
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    return jsonify(_get_cf_mail(mail_id, [payload["address"]], include_raw=True))
+
+@app.route("/api/parsed_mails")
+def cf_api_parsed_mails():
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    return jsonify(_list_cf_mails([payload["address"]], request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=False, parsed=True))
+
+@app.route("/api/parsed_mail/<int:mail_id>")
+def cf_api_parsed_mail(mail_id):
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    return jsonify(_get_cf_mail(mail_id, [payload["address"]], include_raw=False, parsed=True))
+
+@app.route("/api/address_login", methods=["POST"])
+def cf_api_address_login():
+    data = request.get_json(silent=True) or {}
+    try:
+        _cf_store.verify_address_token(data.get("credential") or data.get("jwt") or "")
+        return jsonify({"success": True})
+    except Exception:
+        return Response("InvalidAddressCredentialMsg", status=401)
+
+@app.route("/api/delete_address", methods=["DELETE"])
+def cf_api_delete_address():
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    # 兼容 cftempmail 的地址生命周期接口：这里仅删除本机凭证/绑定，不删除 Apple HME。
+    ok = _cf_store.delete_address_record(payload.get("address_id"), delete_mails=False)
+    return jsonify({"success": ok})
+
+@app.route("/api/clear_inbox", methods=["DELETE"])
+def cf_api_clear_inbox():
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        cur = conn.execute("DELETE FROM inbound_mails WHERE hme_alias=?", (payload["address"],))
+    return jsonify({"success": cur.rowcount >= 0})
+
+@app.route("/api/clear_sent_items", methods=["DELETE"])
+def cf_api_clear_sent_items():
+    payload = _address_payload_or_none()
+    if not payload:
+        return Response("InvalidAddressCredentialMsg", status=401)
+    return jsonify({"success": True})
+
+@app.route("/admin/address")
+def admin_api_address_list():
+    _sync_cf_addresses()
+    return jsonify(_cf_store.list_addresses(
+        query=request.args.get("query", ""),
+        limit=request.args.get("limit", 50, type=int),
+        offset=request.args.get("offset", 0, type=int),
+        sort_by=request.args.get("sort_by", "id"),
+        sort_order=request.args.get("sort_order", "desc"),
+    ))
+
+@app.route("/admin/show_password/<int:address_id>")
+def admin_api_show_password(address_id):
+    return jsonify({"jwt": _cf_store.address_token(address_id=address_id)})
+
+@app.route("/admin/export_credentials")
+@app.route("/admin/export_credentials.<fmt>")
+def admin_api_export_credentials(fmt="json"):
+    _sync_cf_addresses()
+    rows = _cf_store.export_credentials()
+    if str(fmt).lower() == "csv" or request.args.get("format") == "csv":
+        out = io.StringIO()
+        fieldnames = ["id", "name", "jwt", "account_id", "label", "mail_count", "created_at", "updated_at"]
+        writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        return Response("\ufeff" + out.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=icloud_hme_credentials.csv"})
+    return jsonify({"results": rows, "count": len(rows)})
+
+@app.route("/admin/new_address", methods=["POST"])
+def admin_api_new_address():
+    data = request.get_json(silent=True) or {}
+    label = str(data.get("label") or data.get("name") or "admin").strip()
+    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    if not active_accounts:
+        return Response("No active iCloud account", status=400)
+    forward_to = _get_app_settings().get("forward_to_email", "")
+    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label, forward_to=forward_to)
+    ok = next((r for r in results if r.get("ok") and r.get("email")), None)
+    if not ok:
+        return Response((results[0].get("error") if results else "create failed"), status=400)
+    row = _cf_store.ensure_address(ok["email"], account_id=ok.get("account_id", ""), label=label, source="admin")
+    jwt = _cf_store.address_token(address_id=row["id"])
+    return jsonify({"address": row["name"], "address_id": row["id"], "jwt": jwt, "password": None})
+
+@app.route("/api/new_address", methods=["POST"])
+def cf_api_new_address():
+    # cftempmail 兼容端点。本项目禁用匿名创建；管理员或已登录用户可以调用。
+    data = request.get_json(silent=True) or {}
+    label = str(data.get("label") or data.get("name") or "api").strip()
+    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    if not active_accounts:
+        return Response("No active iCloud account", status=400)
+    forward_to = _get_app_settings().get("forward_to_email", "")
+    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label, forward_to=forward_to)
+    ok = next((r for r in results if r.get("ok") and r.get("email")), None)
+    if not ok:
+        return Response((results[0].get("error") if results else "create failed"), status=400)
+    row = _cf_store.ensure_address(ok["email"], account_id=ok.get("account_id", ""), label=label, source="api")
+    jwt = _cf_store.address_token(address_id=row["id"])
+    user = _user_payload_or_none()
+    if user:
+        _cf_store.bind_user_address(user.get("user_id"), row["id"])
+    return jsonify({"address": row["name"], "address_id": row["id"], "jwt": jwt, "password": None})
+
+@app.route("/admin/delete_address/<int:address_id>", methods=["DELETE"])
+def admin_api_delete_address(address_id):
+    return jsonify({"success": _cf_store.delete_address_record(address_id, delete_mails=False)})
+
+@app.route("/admin/clear_inbox/<int:address_id>", methods=["DELETE"])
+def admin_api_clear_inbox(address_id):
+    row = _cf_store.get_address(address_id=address_id)
+    if not row:
+        return jsonify({"success": False})
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        cur = conn.execute("DELETE FROM inbound_mails WHERE hme_alias=?", (row["name"],))
+    return jsonify({"success": cur.rowcount >= 0})
+
+@app.route("/admin/mails")
+def admin_api_mails():
+    address = norm_email(request.args.get("address", ""))
+    if address:
+        return jsonify(_list_cf_mails([address], request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=True))
+    return jsonify(_list_all_cf_mails(request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=True))
+
+@app.route("/admin/mails/<int:mail_id>", methods=["DELETE"])
+def admin_api_delete_mail(mail_id):
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        cur = conn.execute("DELETE FROM inbound_mails WHERE id=?", (int(mail_id),))
+    return jsonify({"success": cur.rowcount > 0})
+
+@app.route("/admin/users")
+def admin_api_users():
+    return jsonify(_cf_store.list_users(
+        query=request.args.get("query", ""),
+        limit=request.args.get("limit", 50, type=int),
+        offset=request.args.get("offset", 0, type=int),
+    ))
+
+@app.route("/admin/users", methods=["POST"])
+def admin_api_create_user():
+    data = request.get_json(silent=True) or {}
+    try:
+        user = _cf_store.create_user(data.get("email", ""), data.get("password", ""), role=data.get("role", "user"))
+        return jsonify({"success": True, "user": user})
+    except Exception as e:
+        return Response(str(e), status=400)
+
+@app.route("/admin/users/<int:user_id>", methods=["DELETE"])
+def admin_api_delete_user(user_id):
+    return jsonify({"success": _cf_store.delete_user(user_id)})
 
 @app.route("/api/state")
 def api_state():
     summary = _account_mgr.get_summary()
+    inbound_stats = _inbound_store.stats()
     with _lock:
         state = dict(_global_state); state.update(summary)
         state["cookies_ok"] = summary["active_accounts"] > 0
         state["alias_count"] = summary["total_aliases"]
         state["alias_active"] = summary["total_active_aliases"]
+        state["local_mail_count"] = inbound_stats.get("total_mails", 0)
+        state["local_mail_alias_count"] = inbound_stats.get("alias_count", 0)
+        state["local_mail_share_count"] = inbound_stats.get("share_count", 0)
     return jsonify(state)
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    payload = _address_payload_or_none()
+    if payload:
+        if request.method != "GET":
+            return Response("Method not allowed for address credential", status=405)
+        return jsonify({
+            "address": payload.get("address"),
+            "address_id": payload.get("address_id"),
+            "send_balance": 0,
+        })
+    if request.method == "GET":
+        return jsonify({"ok":True,"settings":_get_app_settings()})
+    try:
+        payload = request.get_json(silent=True) or {}
+        cfg = _set_app_settings(payload, persist=True)
+        forward_update = None
+        if "forward_to_email" in payload and cfg.get("forward_to_email"):
+            forward_update = _account_mgr.update_forward_to(cfg.get("forward_to_email"))
+            if forward_update.get("ok"):
+                try:
+                    cached_aliases = _sync_cloud_alias_cache()
+                    forward_update["cache_base_count"] = len(cached_aliases)
+                except Exception as cache_err:
+                    forward_update["cache_error"] = str(cache_err)[:200]
+                _emit_log("success", f"Apple HME 转发地址已更新为 {cfg.get('forward_to_email')}")
+            else:
+                _emit_log("warn", f"Apple HME 转发地址更新未完全成功: {forward_update.get('failed_accounts', 0)} 个账号失败")
+        _emit_log("info", f"更新全局邮箱设置: split={cfg.get('alias_split_enabled')} count={cfg.get('alias_split_count')} forward={cfg.get('forward_to_email') or '-'}")
+        return jsonify({"ok":True,"settings":cfg,"forward_update":forward_update})
+    except ValueError as e:
+        return jsonify({"ok":False,"error":str(e)})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/forward-options")
+def api_forward_options():
+    """从 Apple HME 接口读取账号已绑定/允许的转发邮箱，供前端下拉选择。"""
+    try:
+        options = _account_mgr.get_forward_options()
+        cfg = _get_app_settings()
+        return jsonify({
+            "ok": True,
+            "emails": options.get("emails", []),
+            "selected": options.get("selected", ""),
+            "current": cfg.get("forward_to_email", ""),
+            "accounts": options.get("accounts", []),
+        })
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/accounts")
 def api_accounts():
     accounts = _account_mgr.list_accounts()
     safe = []
     for a in accounts:
-        ac = {k:v for k,v in a.items() if k!="cookies"}
+        ac = {k:v for k,v in a.items() if k not in ("cookies","app_password")}
         ac["has_cookies"] = bool(a.get("cookies"))
         ac["has_app_password"] = bool(a.get("app_password"))
         safe.append(ac)
@@ -1770,9 +3827,10 @@ def api_add_account():
     data = request.get_json() or {}
     name = data.get("name","未命名账号")
     cookie_input = data.get("cookie_input","")
+    host = data.get("host","icloud.com")
     if not cookie_input: return jsonify({"ok":False,"error":"请提供 cookie_input"})
     try:
-        account = _account_mgr.add_account(name, cookie_input)
+        account = _account_mgr.add_account(name, cookie_input, host=host)
         _emit_log("info",f"添加账号: {account.get('name','')} ({account.get('real_email','?')})")
         return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status","")})
     except ValueError as e: return jsonify({"ok":False,"error":str(e)})
@@ -1780,8 +3838,31 @@ def api_add_account():
 
 @app.route("/api/accounts/<acc_id>/remove", methods=["POST"])
 def api_remove_account(acc_id):
+    if _global_state.get("running") or _global_state.get("creating"):
+        return jsonify({"ok":False,"error":"调度器运行中，请先停止调度器再删除账号"})
     ok = _account_mgr.remove_account(acc_id)
+    if ok: _emit_log("info", f"删除账号: {acc_id}")
     return jsonify({"ok":ok})
+
+@app.route("/api/accounts/<acc_id>/cookies", methods=["POST"])
+def api_update_account_cookies(acc_id):
+    if _global_state.get("running") or _global_state.get("creating"):
+        return jsonify({"ok":False,"error":"调度器运行中，请先停止调度器再更新 Cookie"})
+    data = request.get_json() or {}
+    cookie_input = data.get("cookie_input","")
+    name = data.get("name")
+    host = data.get("host")
+    if not cookie_input: return jsonify({"ok":False,"error":"请提供 cookie_input"})
+    try:
+        account = _account_mgr.update_account_cookies(acc_id, cookie_input, name=name, host=host)
+        if account.get("status") == "active":
+            _emit_log("info",f"更新 Cookie 成功: {account.get('name','')} ({account.get('real_email','?')})")
+            return jsonify({"ok":True,"id":account["id"],"name":account["name"],"real_email":account.get("real_email",""),"alias_total":account.get("alias_total",0),"alias_active":account.get("alias_active",0),"status":account.get("status","")})
+        _emit_log("warn",f"更新 Cookie 后校验失败: {account.get('name','')} - {account.get('last_error','')[:100]}")
+        return jsonify({"ok":False,"id":account["id"],"status":account.get("status",""),"error":account.get("last_error","校验失败")})
+    except ValueError as e: return jsonify({"ok":False,"error":str(e)})
+    except KeyError as e: return jsonify({"ok":False,"error":str(e)})
+    except Exception as e: return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/accounts/<acc_id>/validate", methods=["POST"])
 def api_validate_account(acc_id):
@@ -1800,7 +3881,8 @@ def api_create_for_account(acc_id):
     acc_name = account.get("name") if account else acc_id
     _emit_log("info",f"[{acc_name}] 手动创建: 账号 {acc_id} x{count}")
     try:
-        results = _account_mgr.create_aliases_for_account(acc_id, count, label)
+        forward_to = _get_app_settings().get("forward_to_email", "")
+        results = _account_mgr.create_aliases_for_account(acc_id, count, label, forward_to=forward_to)
         created = [r["email"] for r in results if r.get("ok")]
         errors = [r["error"] for r in results if not r.get("ok")]
         _update_state(creating=False)
@@ -1826,7 +3908,8 @@ def api_create_batch():
     _update_state(creating=True)
     _emit_log("info",f"批量创建: {len(account_ids)} 个账号 x{count}")
     try:
-        all_results = _account_mgr.create_aliases_batch(account_ids, count, interval, label)
+        forward_to = _get_app_settings().get("forward_to_email", "")
+        all_results = _account_mgr.create_aliases_batch(account_ids, count, interval, label, forward_to=forward_to)
         total_created = sum(sum(1 for r in results if r.get("ok")) for results in all_results.values())
         total_errors = sum(sum(1 for r in results if not r.get("ok")) for results in all_results.values())
         _update_state(creating=False)
@@ -1937,38 +4020,250 @@ def api_alias_mail(acc_id):
 @app.route("/api/aliases")
 def api_aliases():
     try:
-        aliases = _account_mgr.get_all_aliases()
-        return jsonify({"aliases":aliases,"count":len(aliases)})
+        aliases = _sync_cloud_alias_cache()
+        expanded = _expand_email_records(aliases)
+        expanded = _dedupe_email_records(expanded)
+        return jsonify({
+            "aliases": expanded,
+            "count": len(expanded),
+            "base_count": len(aliases),
+            "cached": True,
+        })
     except Exception as e: return jsonify({"aliases":[],"count":0,"error":str(e)})
 
 @app.route("/api/emails")
 def api_emails():
     limit = request.args.get("limit",0,type=int)
-    emails = []
-    f = RESULTS_DIR / "latest_emails.txt"
-    if f.exists():
-        lines = f.read_text(encoding="utf-8").strip().split("\n")
-        if limit>0 and len(lines)>limit: lines = lines[-limit:]
-        for line in lines:
-            line = line.strip()
-            if line and "@" in line:
-                parts = line.split("\t")
-                emails.append({"email":parts[0],"account_id":parts[1] if len(parts)>1 else "","created_at":""})
-    emails.reverse()
-    return jsonify({"emails":emails,"count":len(emails)})
+    include_cloud_cache = request.args.get("cloud_cache","1") != "0"
+    base_records = _read_local_email_records()
+    cloud_records = _load_cached_cloud_aliases() if include_cloud_cache else []
+    records = _dedupe_email_records(base_records + cloud_records)
+    if limit > 0:
+        records = records[:limit]
+    emails = _expand_email_records(records)
+    emails = _dedupe_email_records(emails)
+    return jsonify({
+        "emails": emails,
+        "count": len(emails),
+        "base_count": sum(1 for e in emails if not e.get("derived")),
+        "cloud_cache_count": len(cloud_records),
+    })
+
+@app.route("/api/inbound-config", methods=["GET", "POST"])
+def api_inbound_config():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if data.get("regenerate_token"):
+            _regenerate_inbound_token()
+        if "public_base_url" in data:
+            _inbound_config["public_base_url"] = str(data.get("public_base_url") or "").strip().rstrip("/")
+            _save_inbound_config(_inbound_config)
+    base = _share_base_url()
+    cfg = _get_inbound_config()
+    return jsonify({
+        "ok": True,
+        "inbound_url": f"{base}/api/inbound-mail",
+        "token": cfg.get("token", ""),
+        "public_base_url": cfg.get("public_base_url", ""),
+        "worker_template": f"{base}/cloudflare_inbound_worker.js",
+        "stats": _inbound_store.stats(),
+    })
+
+@app.route("/api/inbound-mail", methods=["POST"])
+def api_inbound_mail():
+    if not _check_inbound_auth():
+        return jsonify({"ok":False,"error":"unauthorized"}), 401
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {
+            "raw": request.get_data(as_text=True),
+            "from": request.headers.get("X-Mail-From", ""),
+            "to": request.headers.get("X-Mail-To", ""),
+            "headers": {k:v for k,v in request.headers.items() if k.lower().startswith("x-mail-")},
+        }
+    try:
+        known_aliases, account_map = _known_aliases_and_account_map()
+        result = _inbound_store.ingest(payload, known_aliases=known_aliases, alias_account_map=account_map)
+        _emit_log("success", f"本机收信: {result.get('hme_alias') or '?'} ← {result.get('subject','')[:60]}")
+        return jsonify({"ok":True, "mail": result})
+    except Exception as e:
+        _emit_log("warn", f"本机收信失败: {str(e)[:120]}")
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/local-inbox/summary")
+def api_local_inbox_summary():
+    alias_filter = request.args.get("q","").strip()
+    assignee = request.args.get("assignee","").strip()
+    aliases = _inbound_store.list_aliases(alias_filter=alias_filter, assignee=assignee)
+    by_alias = {str(row.get("alias") or "").lower(): row for row in aliases if row.get("alias")}
+    shares = {str(row.get("alias") or "").lower(): row for row in _inbound_store.list_shares() if row.get("alias")}
+
+    # 把已经同步/创建过的历史隐私邮箱也放进本机收件箱列表，即使当前收件数为 0，
+    # 这样可以提前给邮箱分配负责人和生成分享链接。
+    q_lower = alias_filter.lower()
+    for rec in _known_alias_records_for_inbound():
+        alias = str(rec.get("email") or "").strip().lower()
+        if not alias or alias in by_alias:
+            continue
+        if q_lower and q_lower not in alias:
+            continue
+        share = shares.get(alias, {})
+        if assignee and str(share.get("assignee") or "") != assignee:
+            continue
+        by_alias[alias] = {
+            "alias": alias,
+            "base_alias": str(rec.get("base_email") or rec.get("base_alias") or alias).lower(),
+            "account_id": rec.get("account_id", ""),
+            "mail_count": 0,
+            "latest_at": "",
+            "assignee": share.get("assignee", ""),
+            "note": share.get("note", ""),
+            "share_token": share.get("share_token", ""),
+            "share_enabled": share.get("enabled", 0),
+        }
+
+    # 分享记录即使不在当前云端缓存里，也保留展示，方便停用/找回链接。
+    for alias, share in shares.items():
+        if alias in by_alias:
+            continue
+        if q_lower and q_lower not in alias:
+            continue
+        if assignee and str(share.get("assignee") or "") != assignee:
+            continue
+        by_alias[alias] = {
+            "alias": alias,
+            "base_alias": share.get("base_alias", alias),
+            "account_id": share.get("account_id", ""),
+            "mail_count": 0,
+            "latest_at": "",
+            "assignee": share.get("assignee", ""),
+            "note": share.get("note", ""),
+            "share_token": share.get("share_token", ""),
+            "share_enabled": share.get("enabled", 0),
+        }
+
+    aliases = list(by_alias.values())
+    aliases.sort(key=lambda r: (int(r.get("mail_count") or 0), str(r.get("latest_at") or ""), str(r.get("alias") or "")), reverse=True)
+    base = _share_base_url()
+    for row in aliases:
+        if row.get("share_token") and row.get("share_enabled"):
+            row["share_url"] = f"{base}/share/{row['share_token']}"
+        else:
+            row["share_url"] = ""
+    return jsonify({
+        "ok": True,
+        "aliases": aliases,
+        "assignees": _inbound_store.list_assignees(),
+        "stats": {**_inbound_store.stats(), "known_alias_count": len(_known_alias_records_for_inbound())},
+    })
+
+@app.route("/api/local-inbox/messages")
+def api_local_inbox_messages():
+    alias = request.args.get("alias","").strip().lower()
+    assignee = request.args.get("assignee","").strip()
+    limit = request.args.get("limit",50,type=int)
+    offset = request.args.get("offset",0,type=int)
+    return jsonify({"ok":True, **_inbound_store.list_messages(alias=alias, assignee=assignee, limit=limit, offset=offset)})
+
+@app.route("/api/local-inbox/messages/<int:mail_id>")
+def api_local_inbox_message(mail_id):
+    msg = _inbound_store.get_message(mail_id)
+    if not msg:
+        return jsonify({"ok":False,"error":"邮件不存在"}), 404
+    return jsonify({"ok":True,"message":msg})
+
+@app.route("/api/local-inbox/share", methods=["POST"])
+def api_local_inbox_share():
+    data = request.get_json(silent=True) or {}
+    try:
+        row = _inbound_store.upsert_share(
+            alias=data.get("alias",""),
+            account_id=data.get("account_id",""),
+            assignee=data.get("assignee",""),
+            note=data.get("note",""),
+            enabled=bool(data.get("enabled", True)),
+            regenerate=bool(data.get("regenerate", False)),
+        )
+        row["share_url"] = f"{_share_base_url()}/share/{row['share_token']}" if row.get("enabled") else ""
+        _emit_log("info", f"更新邮箱分享: {row.get('alias')} → {row.get('assignee') or '-'} enabled={row.get('enabled')}")
+        return jsonify({"ok":True,"share":row})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 400
+
+@app.route("/api/shared/<token>/messages")
+def api_shared_messages(token):
+    share = _inbound_store.get_share(token)
+    if not share:
+        return jsonify({"ok":False,"error":"分享链接无效或已停用"}), 404
+    limit = request.args.get("limit",50,type=int)
+    offset = request.args.get("offset",0,type=int)
+    data = _inbound_store.list_messages(alias=share["alias"], limit=limit, offset=offset)
+    return jsonify({"ok":True,"share":{k:share.get(k) for k in ("alias","assignee","note")} , **data})
+
+@app.route("/api/shared/<token>/messages/<int:mail_id>")
+def api_shared_message(token, mail_id):
+    share = _inbound_store.get_share(token)
+    if not share:
+        return jsonify({"ok":False,"error":"分享链接无效或已停用"}), 404
+    msg = _inbound_store.get_message(mail_id, alias=share["alias"])
+    if not msg:
+        return jsonify({"ok":False,"error":"邮件不存在"}), 404
+    # 分享页面不返回完整 raw，避免外部分发链接暴露过多底层头信息。
+    msg.pop("raw", None)
+    msg.pop("headers_json", None)
+    return jsonify({"ok":True,"message":msg,"share":{k:share.get(k) for k in ("alias","assignee","note")}})
+
+@app.route("/share/<token>")
+def shared_inbox_page(token):
+    return render_template_string(SHARED_INBOX_HTML, token=token)
+
+@app.route("/cloudflare_inbound_worker.js")
+def cloudflare_inbound_worker_template():
+    base = _share_base_url()
+    js = (HERE / "cloudflare_inbound_worker.js").read_text(encoding="utf-8")
+    js = js.replace("__INBOUND_URL__", f"{base}/api/inbound-mail")
+    return Response(js, mimetype="application/javascript; charset=utf-8")
 
 @app.route("/api/scheduler/start", methods=["POST"])
 def api_scheduler_start():
     global _scheduler_thread, _stop_event
+    data = request.get_json(silent=True) or {}
+    if data:
+        _set_scheduler_config(data, persist=True)
+    if _scheduler_thread and _scheduler_thread.is_alive():
+        if _stop_event.is_set():
+            return jsonify({"ok":False,"error":"调度器正在停止，请稍后再启动","stopping":True})
+        return jsonify({"ok":True,"already_running":True,"config":_get_scheduler_config()})
     _stop_event.clear()
     _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
     _scheduler_thread.start()
-    _update_state(running=True)
-    return jsonify({"ok":True})
+    _update_state(running=True, round_status="启动中...")
+    return jsonify({"ok":True,"config":_get_scheduler_config()})
+
+@app.route("/api/scheduler/config", methods=["GET", "POST"])
+def api_scheduler_config():
+    if request.method == "GET":
+        return jsonify({"ok":True,"config":_get_scheduler_config()})
+    try:
+        cfg = _set_scheduler_config(request.get_json(silent=True) or {}, persist=True)
+        return jsonify({"ok":True,"config":cfg})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/api/scheduler/stop", methods=["POST"])
 def api_scheduler_stop():
+    if not _scheduler_thread or not _scheduler_thread.is_alive():
+        _update_state(running=False, creating=False, stopping=False, next_trigger=None, round_status="已停止")
+        return jsonify({"ok":True,"already_stopped":True})
     _stop_event.set()
+    _update_state(stopping=True, next_trigger=None, round_status="停止中：等待当前创建请求结束")
+    _scheduler_thread.join(timeout=2.0)
+    if _scheduler_thread.is_alive():
+        _update_state(running=False, creating=False, stopping=False, next_trigger=None, round_status="已请求停止；当前请求结束后会完全退出")
+        _emit_log("info", "调度器停止已请求；当前创建请求结束后会完全退出")
+        return jsonify({"ok":True,"stopping":True,"note":"current request is still finishing"})
+    _update_state(running=False, creating=False, stopping=False, next_trigger=None, round_status="已停止")
     return jsonify({"ok":True})
 
 @app.route("/api/logs")

@@ -1,0 +1,14 @@
+.git
+.codex
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+logs/
+results/
+accounts.json
+scheduler_state.json
+mail_cache.json
+.deploy-secrets
+.env
