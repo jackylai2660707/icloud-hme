@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading, base64, csv, io, sqlite3
+import sys, os, json, time, queue, secrets, threading, csv, io, sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -48,6 +48,7 @@ _scheduler_config = {}
 _scheduler_runtime = {"rr_index":0}
 _app_settings = {}
 _inbound_config = {}
+ADMIN_COOKIE_NAME = "icloud_admin_auth"
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
 
@@ -340,60 +341,15 @@ def _check_inbound_auth() -> bool:
         supplied = request.headers.get("X-Inbound-Token", "").strip()
     return bool(token and supplied and secrets.compare_digest(token, supplied))
 
-def _read_deploy_secret(key: str) -> str:
-    try:
-        for line in DEPLOY_SECRETS_FILE.read_text(encoding="utf-8").splitlines():
-            if not line or line.lstrip().startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return ""
-
-def _basic_auth_ok() -> bool:
-    auth = request.headers.get("Authorization", "")
-    if not auth.lower().startswith("basic "):
-        return False
-    try:
-        raw = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8", "replace")
-        user, pwd = raw.split(":", 1)
-    except Exception:
-        return False
-    expected_user = _read_deploy_secret("BASIC_AUTH_USER")
-    expected_pwd = _read_deploy_secret("BASIC_AUTH_PASS")
-    return bool(
-        expected_user and expected_pwd
-        and secrets.compare_digest(user, expected_user)
-        and secrets.compare_digest(pwd, expected_pwd)
-    )
-
 def _admin_auth_ok() -> bool:
-    if _basic_auth_ok():
-        return True
     candidates = [
         request.headers.get("x-admin-auth", ""),
-        request.cookies.get("cf_admin_auth", ""),
+        request.cookies.get(ADMIN_COOKIE_NAME, ""),
     ]
     for value in candidates:
         if value and _cf_store.verify_admin_secret(value):
             return True
     return False
-
-def _maybe_set_admin_cookie(resp):
-    if _basic_auth_ok() and not request.cookies.get("cf_admin_auth"):
-        deploy_pass = _read_deploy_secret("BASIC_AUTH_PASS")
-        if deploy_pass:
-            resp.set_cookie(
-                "cf_admin_auth",
-                normalize_password_secret(deploy_pass),
-                max_age=30*24*3600,
-                httponly=False,
-                secure=True,
-                samesite="Lax",
-            )
-    return resp
 
 def _has_bearer_token() -> bool:
     return request.headers.get("Authorization", "").lower().startswith("bearer ")
@@ -535,7 +491,7 @@ def _path_is_cf_address_api(path: str) -> bool:
     return path in exact or path.startswith("/api/mail/") or path.startswith("/api/parsed_mail/")
 
 def _path_is_public(path: str) -> bool:
-    if path in ("/admin", "/user", "/login", "/logout", "/favicon.ico", "/cloudflare_inbound_worker.js"):
+    if path in ("/", "/index.html", "/admin", "/user", "/login", "/logout", "/favicon.ico", "/cloudflare_inbound_worker.js"):
         return True
     return (
         path.startswith("/open_api/")
@@ -563,13 +519,11 @@ def _app_auth_gate():
         if _admin_auth_ok() or _user_payload_or_none():
             return None
         return _json_error("NewAddressAnonymousDisabledMsg", 403)
-    # 其余 /api 和主界面都是管理员能力。Caddy Basic 仍可用；如果未来放开 Caddy，
-    # 这里会用 app 内 admin cookie/header 兜底保护。
-    if path == "/" or path == "/index.html" or path.startswith("/api/"):
+    # 其余 /api 都是管理员能力；外层 Caddy 不再使用 Basic Auth，
+    # 管理后台只接受 app 内 admin cookie 或 x-admin-auth。
+    if path.startswith("/api/"):
         if _admin_auth_ok():
             return None
-        if path == "/" or path == "/index.html":
-            return redirect("/admin")
         return _json_error("NeedAdminPasswordMsg", 401)
     return None
 
@@ -3273,7 +3227,7 @@ async function login(){
   const raw=document.getElementById('pwd').value;
   const password=await sha256(raw);
   const r=await fetch('/open_api/admin_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
-  if(r.ok){localStorage.setItem('cf_admin_auth',password); location.href='/'; return;}
+  if(r.ok){localStorage.setItem('icloud_admin_auth',password); location.href='/admin'; return;}
   document.getElementById('msg').textContent=await r.text()||'登录失败';
 }
 </script></body></html>"""
@@ -3294,7 +3248,7 @@ input,button,select{font:inherit;border:1px solid var(--ink);padding:9px;backgro
 .body{background:#fff;border:1px solid var(--rule);padding:14px;min-height:260px}iframe{width:100%;border:0;background:#fff;min-height:300px}pre{white-space:pre-wrap;word-break:break-word}
 @media(max-width:900px){.wrap{grid-template-columns:1fr}.pane{border-right:0;border-bottom:1px solid var(--rule);max-height:none}}
 </style></head><body>
-<header><h1>My Inbox</h1><div><button class="out" onclick="logout()">退出</button></div></header>
+<header><h1>My Inbox</h1><div style="display:flex;gap:8px"><button class="out" onclick="location.href='/admin'">管理员入口</button><button class="out" onclick="logout()">退出</button></div></header>
 <div class="wrap">
   <aside class="pane"><div class="pad">
     <div class="card">
@@ -3397,7 +3351,7 @@ function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem
 @app.route("/admin")
 def admin_login_page():
     if _admin_auth_ok():
-        return _maybe_set_admin_cookie(make_response(render_template_string(UI_HTML)))
+        return make_response(render_template_string(UI_HTML))
     return render_template_string(ADMIN_LOGIN_HTML)
 
 @app.route("/user")
@@ -3412,12 +3366,15 @@ def login_page():
 def logout_page():
     resp = make_response(redirect("/admin"))
     resp.delete_cookie("cf_admin_auth")
+    resp.delete_cookie(ADMIN_COOKIE_NAME)
     resp.delete_cookie("cf_user_token")
     return resp
 
 @app.route("/")
 @app.route("/index.html")
-def index(): return _maybe_set_admin_cookie(make_response(render_template_string(UI_HTML)))
+def index():
+    # 仿 cftempmail：根路径给普通用户 / 地址凭证入口，管理员从 /admin 进入。
+    return render_template_string(USER_HTML)
 
 # ----- Cloudflare Temp Email compatible open/user/address/admin APIs -----
 
@@ -3450,7 +3407,8 @@ def open_api_admin_login():
         return Response("NeedAdminPasswordMsg", status=401)
     cookie_value = _cf_store.admin_cookie_value(password)
     resp = jsonify({"success": True})
-    resp.set_cookie("cf_admin_auth", cookie_value, max_age=30*24*3600, httponly=False, secure=True, samesite="Lax")
+    resp.set_cookie(ADMIN_COOKIE_NAME, cookie_value, max_age=30*24*3600, httponly=True, secure=True, samesite="Lax")
+    resp.delete_cookie("cf_admin_auth")
     return resp
 
 @app.route("/open_api/site_login", methods=["POST"])
