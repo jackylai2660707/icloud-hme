@@ -410,7 +410,14 @@ def _cf_mail_row(msg: dict, include_raw: bool = True, parsed: bool = False) -> d
         row["attachments"] = []
     return row
 
-def _list_cf_mails(addresses: list, limit: int = 50, offset: int = 0, include_raw: bool = True, parsed: bool = False):
+def _list_cf_mails(
+    addresses: list,
+    limit: int = 50,
+    offset: int = 0,
+    include_raw: bool = True,
+    parsed: bool = False,
+    include_body: bool = True,
+):
     addresses = [norm_email(a) for a in addresses if norm_email(a)]
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
@@ -423,11 +430,14 @@ def _list_cf_mails(addresses: list, limit: int = 50, offset: int = 0, include_ra
             f"SELECT COUNT(*) AS c FROM inbound_mails WHERE hme_alias IN ({placeholders})",
             addresses,
         ).fetchone()["c"]
+        raw_expr = "raw" if include_raw else "'' AS raw"
+        text_expr = "text" if (parsed and include_body) else "'' AS text"
+        html_expr = "html" if (parsed and include_body) else "'' AS html"
         rows = conn.execute(
             f"""
             SELECT id, message_id, source_from, source_from AS "from", envelope_to,
                    hme_alias, base_alias, account_id, subject, sender_name,
-                   text, html, raw, created_at
+                   {text_expr}, {html_expr}, {raw_expr}, created_at
             FROM inbound_mails
             WHERE hme_alias IN ({placeholders})
             ORDER BY created_at DESC, id DESC
@@ -460,16 +470,25 @@ def _get_cf_mail(mail_id: int, addresses: list, include_raw: bool = True, parsed
         ).fetchone()
     return _cf_mail_row(dict(row), include_raw=include_raw, parsed=parsed) if row else None
 
-def _list_all_cf_mails(limit: int = 50, offset: int = 0, include_raw: bool = True, parsed: bool = False):
+def _list_all_cf_mails(
+    limit: int = 50,
+    offset: int = 0,
+    include_raw: bool = True,
+    parsed: bool = False,
+    include_body: bool = True,
+):
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
     with _inbound_store._lock, _inbound_store._connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM inbound_mails").fetchone()["c"]
+        raw_expr = "raw" if include_raw else "'' AS raw"
+        text_expr = "text" if (parsed and include_body) else "'' AS text"
+        html_expr = "html" if (parsed and include_body) else "'' AS html"
         rows = conn.execute(
-            """
+            f"""
             SELECT id, message_id, source_from, source_from AS "from", envelope_to,
                    hme_alias, base_alias, account_id, subject, sender_name,
-                   text, html, raw, created_at
+                   {text_expr}, {html_expr}, {raw_expr}, created_at
             FROM inbound_mails
             ORDER BY created_at DESC, id DESC
             LIMIT ? OFFSET ?
@@ -1717,6 +1736,8 @@ UI_HTML = r"""<!DOCTYPE html>
                     <select id="aliasFilter" onchange="_aliasPage=1;renderAliasTable()">
                         <option value="all">全部账号</option>
                     </select>
+                    <span style="font-size:11px;color:var(--ink-faint)">搜索:</span>
+                    <input id="aliasSearch" type="search" placeholder="邮箱 / 标签 / 账号" oninput="_aliasPage=1;renderAliasTable()" style="min-width:260px">
                 </div>
                 <div class="panel-body">
                     <div id="aliasTableContainer" class="empty">
@@ -2163,6 +2184,29 @@ UI_HTML = r"""<!DOCTYPE html>
         
         var _aliasPage = 1;
         var _aliasPerPage = 20;
+
+        function getFilteredAliases(){
+            var filterEl = E('aliasFilter');
+            var filter = filterEl ? filterEl.value : 'all';
+            var qEl = E('aliasSearch');
+            var q = (qEl ? qEl.value : '').trim().toLowerCase();
+            return emails.filter(function(e){
+                if(filter !== 'all' && e.account_id !== filter) return false;
+                if(!q) return true;
+                var hay = [
+                    e.email || '',
+                    e.label || '',
+                    e.account_name || '',
+                    e.account_email || '',
+                    e.account_id || '',
+                    e.forwardToEmail || '',
+                    e.forward_to || '',
+                    e.source || '',
+                    e.derived ? '派生 derived plus' : ''
+                ].join(' ').toLowerCase();
+                return hay.indexOf(q) >= 0;
+            });
+        }
         
         function aliasPageNav(delta){
             _aliasPage += delta;
@@ -2171,8 +2215,7 @@ UI_HTML = r"""<!DOCTYPE html>
         
         function renderAliasTable(){
             updateEmailFilter();
-            var filter = E('aliasFilter').value;
-            var filtered = filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});
+            var filtered = getFilteredAliases();
             E('emailCount').textContent = filtered.length+' / '+emails.length;
             var c = E('aliasTableContainer');
             if(!filtered.length){
@@ -2187,7 +2230,7 @@ UI_HTML = r"""<!DOCTYPE html>
             pageItems.forEach(function(e,i){
                 var accName = e.account_name||e.account_email||e.account_id||'--';
                 var statusHtml = e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">活跃</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--ink-faint)">--</span>';
-                h += '<tr><td style="color:var(--ink-faint);width:40px">'+((_aliasPage-1)*_aliasPerPage+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td style="font-size:11px">'+esc(accName)+'</td><td style="font-size:11px;color:var(--ink-faint)">'+esc((e.label||'').substring(0,30))+'</td><td>'+statusHtml+'</td><td style="width:70px"><button class="copy-btn" onclick="copyOne(\''+escAttr(e.email)+'\')" title="复制">复制</button></td></tr>';
+                h += '<tr><td style="color:var(--ink-faint);width:40px">'+((_aliasPage-1)*_aliasPerPage+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td style="font-size:11px">'+esc(accName)+'</td><td style="font-size:11px;color:var(--ink-faint)">'+esc((e.label||'').substring(0,30))+'</td><td>'+statusHtml+'</td><td style="width:132px"><button class="copy-btn" onclick="copyOne(\''+escAttr(e.email)+'\')" title="复制邮箱">复制</button> <button class="copy-btn" onclick="copyAutoLogin(\''+escAttr(e.email)+'\',\''+escAttr(e.account_id||'')+'\',\''+escAttr(e.label||'')+'\')" title="生成并复制自动登录链接">登录链接</button></td></tr>';
             });
             h += '</tbody></table>';
             if(totalPages > 1){
@@ -2871,18 +2914,28 @@ UI_HTML = r"""<!DOCTYPE html>
                 toast('已复制: '+email);
             });
         }
+
+        async function copyAutoLogin(email, accountId, label){
+            var d = await api('/admin/address_credential?address='+encodeURIComponent(email)+'&account_id='+encodeURIComponent(accountId||'')+'&label='+encodeURIComponent(label||''));
+            if(!d.ok){
+                toast('生成登录链接失败: '+(d.error||'?'), true);
+                return;
+            }
+            var link = d.login_url || (location.origin + '/?credential=' + encodeURIComponent(d.jwt || ''));
+            navigator.clipboard.writeText(link).then(function(){
+                toast('自动登录链接已复制');
+            });
+        }
         
         function copyAll(){
-            var filter = E('aliasFilter').value;
-            var filtered = filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});
+            var filtered = getFilteredAliases();
             navigator.clipboard.writeText(filtered.map(function(e){return e.email}).join('\n')).then(function(){
                 toast('已复制 '+filtered.length+' 个');
             });
         }
         
         function exportCSV(){
-            var filter = E('aliasFilter').value;
-            var filtered = filter==='all'?emails:emails.filter(function(e){return e.account_id===filter});
+            var filtered = getFilteredAliases();
             var csv = 'email,account,label,active\n'+filtered.map(function(e){
                 return e.email+','+(e.account_name||e.account_id||'')+','+(e.label||'')+','+(e.hasOwnProperty('active')?(e.active?'yes':'no'):'');
             }).join('\n');
@@ -3267,7 +3320,11 @@ input,button,select{font:inherit;border:1px solid var(--ink);padding:9px;backgro
       </div>
       <div class="msg" id="loginMsg"></div>
     </div>
-    <div class="card"><div class="title">地址</div><div class="muted" id="addrHint">未登录</div></div>
+    <div class="card">
+      <div class="title">地址</div>
+      <div class="muted" id="addrHint">未登录</div>
+      <input id="addressSearch" style="width:100%;margin-top:10px" placeholder="搜索邮箱地址" oninput="renderAddresses(currentUserAddresses)">
+    </div>
     <div id="addresses"></div>
   </div></aside>
   <main class="pane"><div class="pad">
@@ -3286,8 +3343,7 @@ function mode(m){E('credBox').classList.toggle('hidden',m!=='cred');E('userBox')
 function setMsg(t,err){E('loginMsg').textContent=t;E('loginMsg').className='msg '+(err?'err':'ok')}
 async function credentialLogin(){
   const jwt=(E('credential').value||addressJwt).trim(); if(!jwt){setMsg('请粘贴凭证',true);return}
-  const r=await fetch('/open_api/credential_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credential:jwt})});
-  if(!r.ok){setMsg(await r.text()||'凭证无效',true);return}
+  userJwt=''; localStorage.removeItem('user_jwt');
   addressJwt=jwt; localStorage.setItem('address_jwt',jwt); await loadAddressSettings();
 }
 async function loadAddressSettings(){
@@ -3316,8 +3372,10 @@ async function loadUserAddresses(){
   const d=await r.json(); currentUserAddresses=d.results||[]; renderAddresses(currentUserAddresses);
 }
 function renderAddresses(list){
-  E('addrHint').textContent=list.length+' 个地址';
-  E('addresses').innerHTML=list.map(a=>{
+  const q=(E('addressSearch')?E('addressSearch').value:'').trim().toLowerCase();
+  const shown=(list||[]).filter(a=>!q||String(a.name||a.address||'').toLowerCase().indexOf(q)>=0);
+  E('addrHint').textContent=shown.length+' / '+(list||[]).length+' 个地址';
+  E('addresses').innerHTML=shown.map(a=>{
     const name=a.name||a.address||'';
     return '<div class="row" data-address="'+esc(name)+'"><div class="title">'+esc(name)+'</div><div class="muted">'+(a.mail_count||0)+' mails</div></div>';
   }).join('')||'<div class="card muted">没有绑定地址</div>';
@@ -3327,8 +3385,8 @@ function renderAddresses(list){
 function selectAddress(a){currentAddress=a; loadMails();}
 async function loadMails(){
   E('mails').innerHTML='加载中...'; let r;
-  if(userJwt){r=await fetch('/user_api/mails?address='+encodeURIComponent(currentAddress||'')+'&limit=50&offset=0',{headers:{'x-user-token':userJwt}})}
-  else if(addressJwt){r=await fetch('/api/parsed_mails?limit=50&offset=0',{headers:{Authorization:'Bearer '+addressJwt}})}
+  if(userJwt){r=await fetch('/user_api/mails?address='+encodeURIComponent(currentAddress||'')+'&limit=30&offset=0&summary=1',{headers:{'x-user-token':userJwt}})}
+  else if(addressJwt){r=await fetch('/api/parsed_mails?limit=30&offset=0&summary=1',{headers:{Authorization:'Bearer '+addressJwt}})}
   else {E('mails').innerHTML='请先登录';return}
   if(!r.ok){E('mails').innerHTML='加载失败';return}
   const d=await r.json(), rows=d.results||[]; E('mails').className='';
@@ -3342,8 +3400,18 @@ async function showMail(id){
   if(m.html){const iframe=document.createElement('iframe'); iframe.sandbox='allow-popups'; iframe.srcdoc=m.html; E('body').innerHTML=''; E('body').appendChild(iframe); iframe.onload=()=>setTimeout(()=>{try{iframe.style.height=(iframe.contentDocument.documentElement.scrollHeight+20)+'px'}catch(e){}},120)}
   else E('body').innerHTML='<pre>'+esc(m.text||m.raw||'(无正文)')+'</pre>';
 }
-function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem('user_jwt');location.reload()}
-(async()=>{if(userJwt){mode('user');await loadUserAddresses()}else if(addressJwt){await loadAddressSettings()}})();
+function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem('user_jwt');location.href='/'}
+(async()=>{
+  const params=new URLSearchParams(location.search);
+  const urlJwt=(params.get('credential')||params.get('jwt')||params.get('token')||'').trim();
+  if(urlJwt){
+    addressJwt=urlJwt; userJwt='';
+    localStorage.setItem('address_jwt',addressJwt); localStorage.removeItem('user_jwt');
+    history.replaceState(null,'',location.pathname);
+  }
+  if(userJwt){mode('user');await loadUserAddresses()}
+  else if(addressJwt){await loadAddressSettings()}
+})();
 </script></body></html>"""
 
 # ----- Flask Routes -----
@@ -3420,7 +3488,6 @@ def open_api_credential_login():
     data = request.get_json(silent=True) or {}
     credential = str(data.get("credential") or "")
     try:
-        _sync_cf_addresses()
         _cf_store.verify_address_token(credential)
         return jsonify({"success": True})
     except Exception:
@@ -3506,7 +3573,15 @@ def user_api_mails():
     addresses = [a["name"] for a in bound]
     if address:
         addresses = [a for a in addresses if a == address]
-    return jsonify(_list_cf_mails(addresses, request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=True, parsed=True))
+    summary = request.args.get("summary", "0") == "1"
+    return jsonify(_list_cf_mails(
+        addresses,
+        request.args.get("limit", 50, type=int),
+        request.args.get("offset", 0, type=int),
+        include_raw=not summary,
+        parsed=True,
+        include_body=not summary,
+    ))
 
 @app.route("/user_api/parsed_mail/<int:mail_id>")
 def user_api_parsed_mail(mail_id):
@@ -3549,7 +3624,15 @@ def cf_api_parsed_mails():
     payload = _address_payload_or_none()
     if not payload:
         return Response("InvalidAddressCredentialMsg", status=401)
-    return jsonify(_list_cf_mails([payload["address"]], request.args.get("limit", 50, type=int), request.args.get("offset", 0, type=int), include_raw=False, parsed=True))
+    summary = request.args.get("summary", "0") == "1"
+    return jsonify(_list_cf_mails(
+        [payload["address"]],
+        request.args.get("limit", 50, type=int),
+        request.args.get("offset", 0, type=int),
+        include_raw=False,
+        parsed=True,
+        include_body=not summary,
+    ))
 
 @app.route("/api/parsed_mail/<int:mail_id>")
 def cf_api_parsed_mail(mail_id):
@@ -3594,7 +3677,8 @@ def cf_api_clear_sent_items():
 
 @app.route("/admin/address")
 def admin_api_address_list():
-    _sync_cf_addresses()
+    if request.args.get("sync", "0") == "1":
+        _sync_cf_addresses()
     return jsonify(_cf_store.list_addresses(
         query=request.args.get("query", ""),
         limit=request.args.get("limit", 50, type=int),
@@ -3605,16 +3689,45 @@ def admin_api_address_list():
 
 @app.route("/admin/show_password/<int:address_id>")
 def admin_api_show_password(address_id):
-    return jsonify({"jwt": _cf_store.address_token(address_id=address_id)})
+    jwt = _cf_store.address_token(address_id=address_id)
+    return jsonify({"jwt": jwt, "login_url": f"{_share_base_url()}/?credential={jwt}"})
+
+@app.route("/admin/address_credential")
+def admin_api_address_credential():
+    address = norm_email(request.args.get("address", ""))
+    if not address:
+        return jsonify({"ok": False, "error": "address required"}), 400
+    try:
+        row = _cf_store.ensure_address(
+            address,
+            account_id=request.args.get("account_id", ""),
+            label=request.args.get("label", ""),
+            source="admin",
+        )
+        jwt = _cf_store.address_token(address_id=row["id"])
+        return jsonify({
+            "ok": True,
+            "id": row["id"],
+            "address": row["name"],
+            "jwt": jwt,
+            "credential": jwt,
+            "login_url": f"{_share_base_url()}/?credential={jwt}",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route("/admin/export_credentials")
 @app.route("/admin/export_credentials.<fmt>")
 def admin_api_export_credentials(fmt="json"):
     _sync_cf_addresses()
     rows = _cf_store.export_credentials()
+    base = _share_base_url()
+    for row in rows:
+        jwt = row.get("jwt") or row.get("credential") or ""
+        row["login_url"] = f"{base}/?credential={jwt}" if jwt else ""
     if str(fmt).lower() == "csv" or request.args.get("format") == "csv":
         out = io.StringIO()
-        fieldnames = ["id", "name", "jwt", "account_id", "label", "mail_count", "created_at", "updated_at"]
+        fieldnames = ["id", "name", "jwt", "login_url", "account_id", "label", "mail_count", "created_at", "updated_at"]
         writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
