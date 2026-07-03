@@ -1901,7 +1901,7 @@ UI_HTML = r"""<!DOCTYPE html>
         var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:false,alias_split_count:4,forward_to_email:''};
         var accounts = [], emails = [], logs = [];
         var forwardOptions = {loaded:false,loading:false,emails:[],selected:'',current:'',accounts:[],error:''};
-        var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedAccount = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false;
+        var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedAccount = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false, localInboxFingerprint = '';
         var curTab = 'dashboard', sseConn = null;
         
         document.querySelectorAll('.nav-item').forEach(function(el){
@@ -2323,8 +2323,17 @@ UI_HTML = r"""<!DOCTYPE html>
             localAliases = d.aliases||[];
             renderLocalAssigneeFilter(d.assignees||[]);
             renderLocalAliasTable(d.stats||{});
-            if(!localInboxLoaded || force){
+            var selected = localSelectedAlias ? (localAliases.find(function(a){return a.alias===localSelectedAlias}) || {}) : {};
+            var fp = [
+                localSelectedAlias || '__all__',
+                (d.stats||{}).total_mails || 0,
+                (d.stats||{}).alias_count || 0,
+                selected.mail_count || 0,
+                selected.latest_at || ''
+            ].join('|');
+            if(!localInboxLoaded || force || fp !== localInboxFingerprint){
                 localInboxLoaded = true;
+                localInboxFingerprint = fp;
                 localMsgOffset = 0;
                 loadLocalMessages(localSelectedAlias || '', 0);
             }
@@ -3001,12 +3010,14 @@ UI_HTML = r"""<!DOCTYPE html>
                 if(Array.isArray(d)){
                     var hasNew = false;
                     var hasCreation = false;
+                    var hasInboundMail = false;
                     d.forEach(function(entry){
                         if(entry.id > lastMaxLogId){
                             if(!logs.some(function(l){return l.id===entry.id})){
                                 logs.push(entry);
                                 hasNew = true;
                                 if(entry.msg && entry.msg.indexOf('创建')>=0) hasCreation = true;
+                                if(entry.msg && entry.msg.indexOf('本机收信:')>=0) hasInboundMail = true;
                             }
                             if(entry.id > lastMaxLogId) lastMaxLogId = entry.id;
                         }
@@ -3016,6 +3027,11 @@ UI_HTML = r"""<!DOCTYPE html>
                         if(logs.length>500) logs = logs.slice(-500);
                         if(curTab==='logs') renderLogs();
                         if(hasCreation) refreshLight();
+                        if(hasInboundMail){
+                            refreshLight();
+                            if(curTab==='local-inbox') refreshLocalInbox(true);
+                            else toast('收到新邮件');
+                        }
                     }
                 }
             } catch(_) {}
@@ -3183,6 +3199,7 @@ UI_HTML = r"""<!DOCTYPE html>
         fetchLogs();
         setInterval(fetchLogs,3000);
         setInterval(refreshLight,10000);
+        setInterval(function(){ if(curTab==='local-inbox') refreshLocalInbox(false); },5000);
         setInterval(refreshAll,30000);
     </script>
 </body>
@@ -3471,8 +3488,8 @@ function renderAddresses(list){
   if(list.length&&!currentAddress) currentAddress=list[0].name||list[0].address;
 }
 function selectAddress(a){currentAddress=a; loadMails();}
-async function loadMails(){
-  E('mails').innerHTML='加载中...'; let r;
+async function loadMails(silent){
+  if(!silent) E('mails').innerHTML='加载中...'; let r;
   if(userJwt){r=await fetch('/user_api/mails?address='+encodeURIComponent(currentAddress||'')+'&limit=30&offset=0&summary=1',{headers:{'x-user-token':userJwt}})}
   else if(addressJwt){r=await fetch('/api/parsed_mails?limit=30&offset=0&summary=1',{headers:{Authorization:'Bearer '+addressJwt}})}
   else {E('mails').innerHTML='请先登录';return}
@@ -3503,6 +3520,7 @@ function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem
   if(userJwt){mode('user');const ok=await loadUserAddresses(); if(!ok&&addressJwt){mode('cred');await loadAddressSettings(true)}}
   else if(addressJwt){await loadAddressSettings(true)}
 })();
+setInterval(function(){ if(userJwt||addressJwt) loadMails(true); },5000);
 </script></body></html>"""
 
 # ----- Flask Routes -----
