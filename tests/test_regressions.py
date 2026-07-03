@@ -177,6 +177,36 @@ def test_inbound_detect_plus_recipient_without_known_alias():
     print("  PASS test_inbound_detect_plus_recipient_without_known_alias")
 
 
+def test_inbound_family_share_does_not_miss_base_mail():
+    """分享/查看 +tag 邮箱时，应同时看到同 base family 的 base 邮件。"""
+    from inbound_mail import InboundMailStore
+
+    with tempfile.TemporaryDirectory() as td:
+        store = InboundMailStore(Path(td) / "inbound.db")
+        raw_base = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: Hide My Email <family-test@icloud.com>\r\n"
+            "Subject: base mail\r\n\r\nbase"
+        )
+        raw_plus = (
+            "Received: from sender.example by mx.example with ESMTP id abc "
+            "for <family-test+3@icloud.com>; Fri, 03 Jul 2026 00:00:00 +0000\r\n"
+            "From: Sender <sender@example.com>\r\n"
+            "To: Hide My Email <family-test@icloud.com>\r\n"
+            "Subject: plus mail\r\n\r\nplus"
+        )
+        base = store.ingest({"raw": raw_base, "to": "inbox@mail.example.com"}, known_aliases=[])
+        plus = store.ingest({"raw": raw_plus, "to": "inbox@mail.example.com"}, known_aliases=[])
+        assert base["hme_alias"] == "family-test@icloud.com"
+        assert plus["hme_alias"] == "family-test+3@icloud.com"
+        rows = store.list_messages(alias="family-test+3@icloud.com", limit=10)["messages"]
+        aliases = {r["hme_alias"] for r in rows}
+        assert "family-test@icloud.com" in aliases
+        assert "family-test+3@icloud.com" in aliases
+        assert store.get_message(base["id"], alias="family-test+3@icloud.com") is not None
+    print("  PASS test_inbound_family_share_does_not_miss_base_mail")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -191,6 +221,7 @@ if __name__ == "__main__":
         ("icloud_hme_account_info", test_icloud_hme_account_info),
         ("cf_credential_normalize_and_id_fallback", test_cf_credential_normalize_and_id_fallback),
         ("inbound_detect_plus_recipient_without_known_alias", test_inbound_detect_plus_recipient_without_known_alias),
+        ("inbound_family_share_does_not_miss_base_mail", test_inbound_family_share_does_not_miss_base_mail),
     ]
     
     passed = 0

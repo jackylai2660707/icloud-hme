@@ -165,6 +165,13 @@ def _email_plus_variant(email: str, index: int) -> str:
     local, domain = str(email).rsplit("@", 1)
     return f"{local}+{index}@{domain}"
 
+def _base_plus_email(email: str) -> str:
+    email = norm_email(email)
+    if "+" not in email or "@" not in email:
+        return email
+    local, domain = email.rsplit("@", 1)
+    return f"{local.split('+', 1)[0]}@{domain}"
+
 def _expand_email_records(records: list, settings: dict = None) -> list:
     settings = settings or _get_app_settings()
     if not settings.get("alias_split_enabled"):
@@ -444,11 +451,16 @@ def _list_cf_mails(
     if not addresses:
         return {"results": [], "count": 0, "limit": limit, "offset": offset}
     # 直接读 inbound_mail.db，避免 list_messages 对单个 alias 的限制。
-    placeholders = ",".join("?" for _ in addresses)
+    # +tag 派生地址按 base family 查询，避免上游把 xxx+3 抹成 xxx 后漏信。
+    base_aliases = sorted({_base_plus_email(a) for a in addresses if _base_plus_email(a)})
+    address_placeholders = ",".join("?" for _ in addresses)
+    base_placeholders = ",".join("?" for _ in base_aliases)
+    where_sql = f"(hme_alias IN ({address_placeholders}) OR base_alias IN ({base_placeholders}))"
+    where_params = addresses + base_aliases
     with _inbound_store._lock, _inbound_store._connect() as conn:
         count = conn.execute(
-            f"SELECT COUNT(*) AS c FROM inbound_mails WHERE hme_alias IN ({placeholders})",
-            addresses,
+            f"SELECT COUNT(*) AS c FROM inbound_mails WHERE {where_sql}",
+            where_params,
         ).fetchone()["c"]
         raw_expr = "raw" if include_raw else "'' AS raw"
         text_expr = "text" if (parsed and include_body) else "'' AS text"
@@ -459,11 +471,11 @@ def _list_cf_mails(
                    hme_alias, base_alias, account_id, subject, sender_name,
                    {text_expr}, {html_expr}, {raw_expr}, created_at
             FROM inbound_mails
-            WHERE hme_alias IN ({placeholders})
+            WHERE {where_sql}
             ORDER BY created_at DESC, id DESC
             LIMIT ? OFFSET ?
             """,
-            addresses + [limit, offset],
+            where_params + [limit, offset],
         ).fetchall()
     return {
         "results": [_cf_mail_row(dict(r), include_raw=include_raw, parsed=parsed) for r in rows],
@@ -476,7 +488,11 @@ def _get_cf_mail(mail_id: int, addresses: list, include_raw: bool = True, parsed
     addresses = [norm_email(a) for a in addresses if norm_email(a)]
     if not addresses:
         return None
-    placeholders = ",".join("?" for _ in addresses)
+    base_aliases = sorted({_base_plus_email(a) for a in addresses if _base_plus_email(a)})
+    address_placeholders = ",".join("?" for _ in addresses)
+    base_placeholders = ",".join("?" for _ in base_aliases)
+    where_sql = f"(hme_alias IN ({address_placeholders}) OR base_alias IN ({base_placeholders}))"
+    where_params = addresses + base_aliases
     with _inbound_store._lock, _inbound_store._connect() as conn:
         row = conn.execute(
             f"""
@@ -484,9 +500,9 @@ def _get_cf_mail(mail_id: int, addresses: list, include_raw: bool = True, parsed
                    hme_alias, base_alias, account_id, subject, sender_name,
                    text, html, raw, headers_json, created_at
             FROM inbound_mails
-            WHERE id=? AND hme_alias IN ({placeholders})
+            WHERE id=? AND {where_sql}
             """,
-            [int(mail_id)] + addresses,
+            [int(mail_id)] + where_params,
         ).fetchone()
     return _cf_mail_row(dict(row), include_raw=include_raw, parsed=parsed) if row else None
 

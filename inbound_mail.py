@@ -349,8 +349,13 @@ class InboundMailStore:
         params: List[Any] = []
         where = []
         if alias:
-            where.append("m.hme_alias = ?")
-            params.append(_norm_email(alias))
+            alias_norm = _norm_email(alias)
+            # +tag 地址不是 Apple HME 的真实独立邮箱；部分上游会把
+            # xxx+3@icloud.com 规范化/转发成 xxx@icloud.com。按单个 hme_alias
+            # 精确筛选会漏掉这类被归到 base 的邮件。这里把 base 与所有 +tag
+            # 视为同一个 family 收件箱，分享链接和用户收件箱都不会漏。
+            where.append("(m.hme_alias = ? OR m.base_alias = ?)")
+            params.extend([alias_norm, _base_plus_email(alias_norm)])
         if assignee:
             where.append("COALESCE(s.assignee, m.assigned_to, '') = ?")
             params.append(assignee)
@@ -382,8 +387,9 @@ class InboundMailStore:
         params: List[Any] = [int(mail_id)]
         where = ["m.id = ?"]
         if alias:
-            where.append("m.hme_alias = ?")
-            params.append(_norm_email(alias))
+            alias_norm = _norm_email(alias)
+            where.append("(m.hme_alias = ? OR m.base_alias = ?)")
+            params.extend([alias_norm, _base_plus_email(alias_norm)])
         if assignee:
             where.append("COALESCE(s.assignee, m.assigned_to, '') = ?")
             params.append(assignee)
@@ -436,8 +442,8 @@ class InboundMailStore:
                 )
             if assignee.strip():
                 conn.execute(
-                    "UPDATE inbound_mails SET assigned_to=? WHERE hme_alias=?",
-                    (assignee.strip(), alias),
+                    "UPDATE inbound_mails SET assigned_to=? WHERE hme_alias=? OR base_alias=?",
+                    (assignee.strip(), alias, base_alias),
                 )
             row = conn.execute("SELECT * FROM alias_shares WHERE alias=?", (alias,)).fetchone()
         return dict(row)
