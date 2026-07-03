@@ -157,6 +157,26 @@ def test_cf_credential_normalize_and_id_fallback():
     print("  PASS test_cf_credential_normalize_and_id_fallback")
 
 
+def test_inbound_detect_plus_recipient_without_known_alias():
+    """即使 known_aliases 里没有 +3，也应从 Received for 恢复真实派生收件人。"""
+    from inbound_mail import InboundMailStore
+
+    raw = (
+        "Received: from sender.example by mx.example with ESMTP id abc "
+        "for <demo-alias+3@icloud.com>; Fri, 03 Jul 2026 00:00:00 +0000\r\n"
+        "From: Sender <sender@example.com>\r\n"
+        "To: Hide My Email <demo-alias@icloud.com>\r\n"
+        "Subject: plus test\r\n"
+        "\r\n"
+        "hello"
+    )
+    parsed = InboundMailStore.parse_raw(raw)
+    detected = InboundMailStore.detect_alias({"raw": raw, "to": "inbox@mail.example.com"}, parsed, known_aliases=[])
+    assert detected["hme_alias"] == "demo-alias+3@icloud.com"
+    assert detected["base_alias"] == "demo-alias@icloud.com"
+    print("  PASS test_inbound_detect_plus_recipient_without_known_alias")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -170,6 +190,7 @@ if __name__ == "__main__":
         ("strip_html_with_link", test_strip_html_with_link),
         ("icloud_hme_account_info", test_icloud_hme_account_info),
         ("cf_credential_normalize_and_id_fallback", test_cf_credential_normalize_and_id_fallback),
+        ("inbound_detect_plus_recipient_without_known_alias", test_inbound_detect_plus_recipient_without_known_alias),
     ]
     
     passed = 0

@@ -22,6 +22,12 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
+RECIPIENT_PLUS_RE = re.compile(
+    r"(?is)(?:^|\n|\r)(?:"
+    r"(?:delivered-to|x-original-to|x-forwarded-to|envelope-to|apparently-to|resent-to|to|cc)\s*:\s*"
+    r"|received\s*:.*?\bfor\s+<?"
+    r")([A-Z0-9._%\-]+\+[A-Z0-9._%+\-]+@(?:icloud|me|mac)\.com)\b"
+)
 
 
 def _now_iso() -> str:
@@ -210,6 +216,22 @@ class InboundMailStore:
         for alias in sorted(known, key=len, reverse=True):
             if alias and alias in candidates_text:
                 return {"hme_alias": alias, "base_alias": _base_plus_email(alias)}
+
+        # Apple Hide My Email 转发后经常把展示 To 改成基础地址：
+        #   To: Hide My Email <xxx@icloud.com>
+        # 但上游 Received 链里仍可能保留真正的 RCPT：
+        #   ... for <xxx+3@icloud.com>
+        # 如果 split 设置/缓存暂时缺失，不能让后面的通用邮箱兜底先命中 base。
+        # 这里优先从收件人相关头和 Received for 段恢复 +tag 地址。
+        recipientish_text = "\n".join([
+            str(payload.get("raw") or "")[:200000],
+            "\n".join(header_values),
+            str(parsed.get("to") or ""),
+        ])
+        for found in RECIPIENT_PLUS_RE.findall(recipientish_text):
+            found = _norm_email(found)
+            if found.endswith(("@icloud.com", "@me.com", "@mac.com")):
+                return {"hme_alias": found, "base_alias": _base_plus_email(found)}
 
         # 没有命中已知邮箱时，从头部/正文中兜底找一个 @icloud/@me/@mac 地址。
         for found in EMAIL_RE.findall(candidates_text):
