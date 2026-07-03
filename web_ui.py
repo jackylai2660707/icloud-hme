@@ -12,7 +12,7 @@ from flask import Flask, Response, request, jsonify, render_template_string, red
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from inbound_mail import InboundMailStore
-from cf_compat import CfCompatStore, normalize_password_secret, norm_email
+from cf_compat import CfCompatStore, normalize_password_secret, normalize_jwt_token, norm_email
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
@@ -357,17 +357,37 @@ def _has_bearer_token() -> bool:
 def _get_bearer_token() -> str:
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
+        return normalize_jwt_token(auth.split(" ", 1)[1])
     return ""
 
-def _address_payload_or_none():
+def _credential_error_code(exc: Exception | str) -> tuple[str, str]:
+    msg = str(exc or "").strip()
+    lower = msg.lower()
+    if not msg:
+        return "InvalidAddressCredentialMsg", "unknown"
+    if "expired" in lower:
+        return "AddressCredentialExpiredMsg", "expired"
+    if "signature" in lower:
+        return "InvalidAddressCredentialMsg", "bad_signature"
+    if "address not found" in lower:
+        return "AddressCredentialAddressNotFoundMsg", "address_not_found"
+    if "malformed" in lower or "invalid token" in lower or "incorrect padding" in lower:
+        return "InvalidAddressCredentialMsg", "malformed_token"
+    return "InvalidAddressCredentialMsg", "invalid_token"
+
+def _address_payload_or_error():
     token = _get_bearer_token()
     if not token:
-        return None
+        return None, "MissingAddressCredentialMsg", "missing"
     try:
-        return _cf_store.verify_address_token(token)
-    except Exception:
-        return None
+        return _cf_store.verify_address_token(token), "", ""
+    except Exception as e:
+        code, detail = _credential_error_code(e)
+        return None, code, detail
+
+def _address_payload_or_none():
+    payload, _, _ = _address_payload_or_error()
+    return payload
 
 def _user_payload_or_none():
     token = request.headers.get("x-user-token", "") or request.cookies.get("cf_user_token", "")
@@ -502,15 +522,18 @@ def _list_all_cf_mails(
         "offset": offset,
     }
 
-def _json_error(message: str, status: int = 401):
-    return jsonify({"success": False, "error": message}), status
+def _json_error(message: str, status: int = 401, detail: str = ""):
+    body = {"success": False, "error": message}
+    if detail:
+        body["detail"] = detail
+    return jsonify(body), status
 
 def _path_is_cf_address_api(path: str) -> bool:
     exact = {"/api/settings", "/api/mails", "/api/parsed_mails", "/api/delete_address", "/api/clear_inbox", "/api/clear_sent_items", "/api/address_login"}
     return path in exact or path.startswith("/api/mail/") or path.startswith("/api/parsed_mail/")
 
 def _path_is_public(path: str) -> bool:
-    if path in ("/", "/index.html", "/admin", "/user", "/login", "/logout", "/favicon.ico", "/cloudflare_inbound_worker.js"):
+    if path in ("/", "/index.html", "/admin", "/user", "/login", "/logout", "/favicon.ico", "/cloudflare_inbound_worker.js", "/api/address_login"):
         return True
     return (
         path.startswith("/open_api/")
@@ -530,9 +553,17 @@ def _app_auth_gate():
             return None
         return _json_error("NeedAdminPasswordMsg", 401)
     if _path_is_cf_address_api(path):
-        if _address_payload_or_none() or _admin_auth_ok():
+        # 如果请求显式带了 Bearer，优先按地址凭证处理；不要因为同浏览器里
+        # 还保留 admin cookie 就把坏凭证误放行到管理员分支，避免前端出现
+        # “同一个凭证有时可用、有时 undefined/失效”的混乱状态。
+        if _has_bearer_token():
+            payload, err, detail = _address_payload_or_error()
+            if payload:
+                return None
+            return _json_error(err, 401, detail)
+        if _admin_auth_ok():
             return None
-        return _json_error("InvalidAddressCredentialMsg", 401)
+        return _json_error("MissingAddressCredentialMsg", 401, "missing")
     # 这些创建接口兼容 cftempmail，但本项目默认要求管理员或已登录用户。
     if path == "/api/new_address":
         if _admin_auth_ok() or _user_payload_or_none():
@@ -3341,14 +3372,70 @@ const E=id=>document.getElementById(id); const esc=s=>String(s||'').replace(/[&<
 async function sha256(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
 function mode(m){E('credBox').classList.toggle('hidden',m!=='cred');E('userBox').classList.toggle('hidden',m!=='user')}
 function setMsg(t,err){E('loginMsg').textContent=t;E('loginMsg').className='msg '+(err?'err':'ok')}
-async function credentialLogin(){
-  const jwt=(E('credential').value||addressJwt).trim(); if(!jwt){setMsg('请粘贴凭证',true);return}
-  userJwt=''; localStorage.removeItem('user_jwt');
-  addressJwt=jwt; localStorage.setItem('address_jwt',jwt); await loadAddressSettings();
+function normalizeCredential(raw){
+  let s=String(raw||'').trim(); if(!s)return '';
+  for(let i=0;i<3;i++){
+    if((s[0]==='"'&&s[s.length-1]==='"')||(s[0]==="'"&&s[s.length-1]==="'")||(s[0]==='<'&&s[s.length-1]==='>')) s=s.slice(1,-1).trim();
+    else break;
+  }
+  s=s.replace(/^Bearer\s+/i,'').trim();
+  try{s=decodeURIComponent(s)}catch(e){}
+  s=s.replace(/\\r|\\n|\\t/g,'');
+  try{
+    const u=new URL(s, location.origin);
+    const v=u.searchParams.get('credential')||u.searchParams.get('jwt')||u.searchParams.get('token');
+    if(v)return normalizeCredential(v);
+    const hp=new URLSearchParams((u.hash||'').replace(/^#/,''));
+    const hv=hp.get('credential')||hp.get('jwt')||hp.get('token');
+    if(hv)return normalizeCredential(hv);
+  }catch(e){}
+  if(s.indexOf('=')>=0){
+    try{
+      const p=new URLSearchParams(s.replace(/^[?#]/,''));
+      const v=p.get('credential')||p.get('jwt')||p.get('token');
+      if(v)return normalizeCredential(v);
+    }catch(e){}
+  }
+  s=s.replace(/\s+/g,'');
+  const m=s.match(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+  return m?m[0]:s;
 }
-async function loadAddressSettings(){
-  const r=await fetch('/api/settings',{headers:{Authorization:'Bearer '+addressJwt}}); if(!r.ok){setMsg('凭证过期或无效',true);return}
-  const d=await r.json(); currentAddress=d.address; currentUserAddresses=[{name:d.address,id:d.address_id||0,mail_count:0}]; renderAddresses(currentUserAddresses); setMsg('已进入 '+d.address,false); loadMails();
+async function readError(r,fallback){
+  let t=''; try{t=await r.text()}catch(e){}
+  if(t){
+    try{const j=JSON.parse(t); return j.error||j.message||j.detail||fallback}catch(e){}
+    return t;
+  }
+  return fallback;
+}
+function friendlyCredentialError(err){
+  const map={
+    MissingAddressCredentialMsg:'缺少地址凭证',
+    InvalidAddressCredentialMsg:'凭证过期或无效',
+    AddressCredentialExpiredMsg:'凭证已过期，请让管理员重新导出',
+    AddressCredentialAddressNotFoundMsg:'凭证对应邮箱已从本机地址表删除，请让管理员重新导出'
+  };
+  return map[err]||err||'凭证过期或无效';
+}
+async function credentialLogin(){
+  const jwt=normalizeCredential(E('credential').value||addressJwt); if(!jwt){setMsg('请粘贴凭证',true);return}
+  userJwt=''; localStorage.removeItem('user_jwt');
+  addressJwt=jwt; await loadAddressSettings(true);
+}
+async function loadAddressSettings(clearOnFail){
+  const jwt=normalizeCredential(addressJwt); if(!jwt){return false}
+  addressJwt=jwt;
+  const r=await fetch('/api/settings',{headers:{Authorization:'Bearer '+jwt}});
+  if(!r.ok){
+    const err=await readError(r,'凭证过期或无效');
+    setMsg(friendlyCredentialError(err),true);
+    if(clearOnFail){addressJwt='';localStorage.removeItem('address_jwt')}
+    return false;
+  }
+  const d=await r.json();
+  if(!d.address){setMsg('凭证响应异常，请刷新后重试',true); if(clearOnFail){addressJwt='';localStorage.removeItem('address_jwt')} return false}
+  localStorage.setItem('address_jwt',jwt);
+  currentAddress=d.address; currentUserAddresses=[{name:d.address,id:d.address_id||0,mail_count:0}]; renderAddresses(currentUserAddresses); setMsg('已进入 '+d.address,false); loadMails(); return true;
 }
 async function userRegister(){
   const password=await sha256(E('password').value); const email=E('email').value.trim();
@@ -3363,13 +3450,14 @@ async function userLogin(){
 }
 async function bindCredential(){
   if(!userJwt){setMsg('请先用户登录',true);return}
-  const jwt=E('bindCredential').value.trim(); if(!jwt){setMsg('请粘贴地址凭证',true);return}
+  const jwt=normalizeCredential(E('bindCredential').value); if(!jwt){setMsg('请粘贴地址凭证',true);return}
   const r=await fetch('/user_api/bind_address',{method:'POST',headers:{'x-user-token':userJwt,Authorization:'Bearer '+jwt}});
-  if(!r.ok){setMsg(await r.text()||'绑定失败',true);return} setMsg('绑定成功',false); loadUserAddresses();
+  if(!r.ok){setMsg(await readError(r,'绑定失败'),true);return} setMsg('绑定成功',false); loadUserAddresses();
 }
 async function loadUserAddresses(){
-  const r=await fetch('/user_api/bind_address',{headers:{'x-user-token':userJwt}}); if(!r.ok){setMsg('用户登录过期',true);return}
-  const d=await r.json(); currentUserAddresses=d.results||[]; renderAddresses(currentUserAddresses);
+  const r=await fetch('/user_api/bind_address',{headers:{'x-user-token':userJwt}});
+  if(!r.ok){setMsg('用户登录过期',true);userJwt='';localStorage.removeItem('user_jwt');return false}
+  const d=await r.json(); currentUserAddresses=d.results||[]; renderAddresses(currentUserAddresses); return true;
 }
 function renderAddresses(list){
   const q=(E('addressSearch')?E('addressSearch').value:'').trim().toLowerCase();
@@ -3402,15 +3490,18 @@ async function showMail(id){
 }
 function logout(){localStorage.removeItem('address_jwt');localStorage.removeItem('user_jwt');location.href='/'}
 (async()=>{
+  addressJwt=normalizeCredential(addressJwt); if(addressJwt)localStorage.setItem('address_jwt',addressJwt);
   const params=new URLSearchParams(location.search);
-  const urlJwt=(params.get('credential')||params.get('jwt')||params.get('token')||'').trim();
+  const urlJwt=normalizeCredential(params.get('credential')||params.get('jwt')||params.get('token')||'');
   if(urlJwt){
     addressJwt=urlJwt; userJwt='';
-    localStorage.setItem('address_jwt',addressJwt); localStorage.removeItem('user_jwt');
+    localStorage.removeItem('user_jwt');
     history.replaceState(null,'',location.pathname);
+    await loadAddressSettings(true);
+    return;
   }
-  if(userJwt){mode('user');await loadUserAddresses()}
-  else if(addressJwt){await loadAddressSettings()}
+  if(userJwt){mode('user');const ok=await loadUserAddresses(); if(!ok&&addressJwt){mode('cred');await loadAddressSettings(true)}}
+  else if(addressJwt){await loadAddressSettings(true)}
 })();
 </script></body></html>"""
 
@@ -3486,12 +3577,13 @@ def open_api_site_login():
 @app.route("/open_api/credential_login", methods=["POST"])
 def open_api_credential_login():
     data = request.get_json(silent=True) or {}
-    credential = str(data.get("credential") or "")
+    credential = normalize_jwt_token(data.get("credential") or data.get("jwt") or data.get("token") or "")
     try:
         _cf_store.verify_address_token(credential)
         return jsonify({"success": True})
-    except Exception:
-        return Response("InvalidAddressCredentialMsg", status=401)
+    except Exception as e:
+        code, detail = _credential_error_code(e)
+        return jsonify({"success": False, "error": code, "detail": detail}), 401
 
 @app.route("/user_api/open_settings")
 def user_api_open_settings():
@@ -3645,10 +3737,11 @@ def cf_api_parsed_mail(mail_id):
 def cf_api_address_login():
     data = request.get_json(silent=True) or {}
     try:
-        _cf_store.verify_address_token(data.get("credential") or data.get("jwt") or "")
+        _cf_store.verify_address_token(data.get("credential") or data.get("jwt") or data.get("token") or "")
         return jsonify({"success": True})
-    except Exception:
-        return Response("InvalidAddressCredentialMsg", status=401)
+    except Exception as e:
+        code, detail = _credential_error_code(e)
+        return jsonify({"success": False, "error": code, "detail": detail}), 401
 
 @app.route("/api/delete_address", methods=["DELETE"])
 def cf_api_delete_address():
@@ -3833,7 +3926,7 @@ def api_state():
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
-    payload = _address_payload_or_none()
+    payload, err, detail = _address_payload_or_error()
     if payload:
         if request.method != "GET":
             return Response("Method not allowed for address credential", status=405)
@@ -3842,6 +3935,8 @@ def api_settings():
             "address_id": payload.get("address_id"),
             "send_balance": 0,
         })
+    if _has_bearer_token():
+        return _json_error(err, 401, detail)
     if request.method == "GET":
         return jsonify({"ok":True,"settings":_get_app_settings()})
     try:

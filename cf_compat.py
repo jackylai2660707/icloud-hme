@@ -20,9 +20,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
+from urllib.parse import parse_qs, unquote, urlparse
 
 EMAIL_RE = re.compile(r"(?i)^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$")
 HEX64_RE = re.compile(r"^[a-f0-9]{64}$", re.I)
+JWT_IN_TEXT_RE = re.compile(r"([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)")
 
 
 def now_iso() -> str:
@@ -47,6 +49,60 @@ def b64url_decode(data: str) -> bytes:
 
 def sha256_hex(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def normalize_jwt_token(value: Any) -> str:
+    """容错清洗 Address/User JWT。
+
+    实际使用里用户经常从 CSV、聊天工具或浏览器地址栏复制凭证，可能带上：
+    - 完整登录 URL：/?credential=<jwt>
+    - Authorization 前缀：Bearer <jwt>
+    - 引号、尖括号、换行/空格、URL 编码
+
+    JWT 本身只使用 base64url 字符和点号，所以去掉空白并提取签名段是安全的；
+    真正的权限仍由 HMAC 签名校验决定。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+
+    # 去掉 CSV/聊天工具常见包裹。
+    for _ in range(3):
+        if len(s) >= 2 and ((s[0], s[-1]) in {('"', '"'), ("'", "'"), ("<", ">")}):
+            s = s[1:-1].strip()
+        else:
+            break
+
+    if s.lower().startswith("bearer "):
+        s = s.split(None, 1)[1].strip()
+
+    try:
+        decoded = unquote(s)
+    except Exception:
+        decoded = s
+    decoded = decoded.replace("\\r", "").replace("\\n", "").replace("\\t", "")
+
+    # 支持粘贴完整登录链接，或只粘贴 query/hash。
+    for candidate in (decoded, decoded.lstrip("?#")):
+        try:
+            parsed = urlparse(candidate)
+            for part in (parsed.query, parsed.fragment):
+                params = parse_qs(part, keep_blank_values=True)
+                for key in ("credential", "jwt", "token"):
+                    if params.get(key):
+                        return normalize_jwt_token(params[key][0])
+            if "=" in candidate:
+                params = parse_qs(candidate, keep_blank_values=True)
+                for key in ("credential", "jwt", "token"):
+                    if params.get(key):
+                        return normalize_jwt_token(params[key][0])
+        except Exception:
+            pass
+
+    # JWT 不包含空白；这一步修复复制时被换行/空格打断的 token。
+    compact = re.sub(r"\s+", "", decoded)
+    m = JWT_IN_TEXT_RE.search(compact)
+    return m.group(1) if m else compact
 
 
 def normalize_password_secret(value: str) -> str:
@@ -162,10 +218,10 @@ class CfCompatStore:
         return f"{h}.{p}.{b64url_encode(sig)}"
 
     def verify(self, token: str) -> Dict[str, Any]:
-        token = str(token or "").strip()
+        token = normalize_jwt_token(token)
         parts = token.split(".")
         if len(parts) != 3:
-            raise ValueError("Invalid token")
+            raise ValueError("Malformed token")
         msg = f"{parts[0]}.{parts[1]}".encode("ascii")
         expected = hmac.new(str(self._config.get("jwt_secret") or "").encode("utf-8"), msg, hashlib.sha256).digest()
         actual = b64url_decode(parts[2])
@@ -243,8 +299,19 @@ class CfCompatStore:
         address_id = payload.get("address_id")
         if not address:
             raise ValueError("invalid address credential")
-        row = self.get_address(address_id=address_id) if address_id else self.get_address(name=address)
-        if not row or row.get("name") != address:
+        row = None
+        if address_id:
+            try:
+                row = self.get_address(address_id=address_id)
+            except Exception:
+                row = None
+            # 老导出凭证里的 address_id 可能因为删除/重建本机记录而失效；
+            # JWT 已经签名校验通过时，地址字符串本身才是稳定身份，允许按地址兜底。
+            if row and row.get("name") != address:
+                row = None
+        if not row:
+            row = self.get_address(name=address)
+        if not row:
             raise ValueError("address not found")
         payload["address"] = address
         payload["address_id"] = int(row["id"])

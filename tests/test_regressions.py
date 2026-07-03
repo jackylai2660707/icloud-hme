@@ -4,6 +4,7 @@
 import sys
 import json
 import os
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -132,6 +133,30 @@ def test_icloud_hme_account_info():
     print("  PASS test_icloud_hme_account_info")
 
 
+def test_cf_credential_normalize_and_id_fallback():
+    """地址 JWT 支持完整 URL/换行/Bearer，且旧 address_id 失效时按地址兜底。"""
+    from cf_compat import CfCompatStore, normalize_jwt_token
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        store = CfCompatStore(base / "mail.db", base / "cf_config.json", base / ".deploy-secrets")
+        row = store.ensure_address("old-id-test@icloud.com", source="test")
+        token = store.address_token(address_id=row["id"])
+
+        noisy = f'Bearer "https://icloud.example/?credential={token[:20]}\\n{token[20:]}"'
+        assert normalize_jwt_token(noisy) == token
+        assert store.verify_address_token(noisy)["address"] == "old-id-test@icloud.com"
+
+        # 模拟本机地址表被删除/重建后 id 改变；签名有效且地址仍存在时应继续可用。
+        store.delete_address_record(row["id"], delete_mails=False)
+        recreated = store.ensure_address("old-id-test@icloud.com", source="test")
+        assert recreated["id"] != row["id"]
+        payload = store.verify_address_token(token)
+        assert payload["address"] == "old-id-test@icloud.com"
+        assert payload["address_id"] == recreated["id"]
+    print("  PASS test_cf_credential_normalize_and_id_fallback")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -144,6 +169,7 @@ if __name__ == "__main__":
         ("strip_html", test_strip_html),
         ("strip_html_with_link", test_strip_html_with_link),
         ("icloud_hme_account_info", test_icloud_hme_account_info),
+        ("cf_credential_normalize_and_id_fallback", test_cf_credential_normalize_and_id_fallback),
     ]
     
     passed = 0
