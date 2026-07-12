@@ -1672,7 +1672,7 @@ UI_HTML = r"""<!DOCTYPE html>
         <a class="nav-item" data-tab="emails">邮箱列表</a>
         <a class="nav-item" data-tab="batch">批量创建</a>
         <a class="nav-item" data-tab="local-inbox">收件箱</a>
-        <a class="nav-item" data-tab="docs">API 文档</a>
+        <a class="nav-item" data-tab="agent">Agent 提示词</a>
         <a class="nav-item" data-tab="logs">运行日志</a>
         <div class="section-label">账号列表</div>
         <div id="sidebarAccounts"></div>
@@ -1847,8 +1847,7 @@ UI_HTML = r"""<!DOCTYPE html>
                     <span>Admin 收件箱</span>
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
                         <button class="btn btn-outline btn-sm" onclick="loadAllLocalInbox()">全部邮件</button>
-                        <input type="text" id="localAliasSearch" placeholder="搜索邮箱 / 负责人" style="width:220px">
-                        <select id="localAssigneeFilter" style="width:140px"><option value="">全部负责人</option></select>
+                        <input type="text" id="localAliasSearch" placeholder="搜索邮箱地址" style="width:260px">
                         <button class="btn btn-outline btn-sm" onclick="refreshLocalInbox(true)">刷新</button>
                         <button class="btn btn-outline btn-sm" onclick="openWorkerConfig()">Worker 配置</button>
                     </div>
@@ -1888,12 +1887,33 @@ UI_HTML = r"""<!DOCTYPE html>
             </div>
         </div>
         
-        <div id="view-docs" style="display:none">
-            <div class="panel" style="font-family:var(--mono);font-size:13px;line-height:1.8">
+        <div id="view-agent" style="display:none">
+            <div class="panel">
                 <div class="panel-header">
-                    <span>API 文档</span>
+                    <span>Agent 管理提示词</span>
+                    <div style="display:flex;gap:8px">
+                        <button class="btn btn-outline btn-sm" onclick="renderAgentPrompt()">重新生成</button>
+                        <button class="btn btn-primary btn-sm" onclick="copyAgentPrompt()">复制提示词</button>
+                    </div>
                 </div>
-                <div class="panel-body" style="padding:20px 24px" id="docsContent"></div>
+                <div class="panel-body" style="padding:20px 24px">
+                    <div style="padding:12px 14px;border:1px solid var(--rule-strong);background:var(--paper-dim);font-size:12px;line-height:1.7;margin-bottom:14px">
+                        把下面整段提示词交给其他 Agent，它就能通过 Admin API 获取账号、邮箱列表、收件箱、登录链接、计划任务和系统状态。<br>
+                        <b style="color:var(--red)">注意：</b>包含 Admin Token 时等同授予完整管理员权限，请只发给可信 Agent。
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:12px">
+                        <label style="font-size:12px">Base URL
+                            <input id="agentBaseUrl" type="text" style="display:block;width:100%;margin-top:5px" oninput="renderAgentPrompt()">
+                        </label>
+                        <label style="font-size:12px">Admin API Token
+                            <input id="agentAdminToken" type="password" style="display:block;width:100%;margin-top:5px" oninput="renderAgentPrompt()" placeholder="从当前管理员登录自动读取">
+                        </label>
+                    </div>
+                    <label style="font-size:12px;display:flex;align-items:center;gap:8px;margin-bottom:12px">
+                        <input id="agentIncludeToken" type="checkbox" checked onchange="renderAgentPrompt()"> 在提示词中包含当前 Admin Token（可直接执行）
+                    </label>
+                    <textarea id="agentPromptText" readonly style="width:100%;min-height:590px;resize:vertical;padding:16px;border:1px solid var(--ink);background:#fff;font:12px/1.65 var(--mono);color:var(--ink);white-space:pre-wrap"></textarea>
+                </div>
             </div>
         </div>
         
@@ -1917,7 +1937,7 @@ UI_HTML = r"""<!DOCTYPE html>
         var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:false,alias_split_count:4,forward_to_email:''};
         var accounts = [], emails = [], logs = [];
         var forwardOptions = {loaded:false,loading:false,emails:[],selected:'',current:'',accounts:[],error:''};
-        var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedAccount = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false, localInboxFingerprint = '';
+        var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false, localInboxFingerprint = '';
         var curTab = 'dashboard', sseConn = null;
         
         document.querySelectorAll('.nav-item').forEach(function(el){
@@ -1931,10 +1951,10 @@ UI_HTML = r"""<!DOCTYPE html>
                 E('view-batch').style.display = curTab==='batch'?'block':'none';
                 E('view-inbox').style.display = curTab==='inbox'?'block':'none';
                 E('view-local-inbox').style.display = curTab==='local-inbox'?'block':'none';
-                E('view-docs').style.display = curTab==='docs'?'block':'none';
+                E('view-agent').style.display = curTab==='agent'?'block':'none';
                 E('view-logs').style.display = curTab==='logs'?'block':'none';
                 
-                var titles = {dashboard:'仪表盘',emails:'邮箱列表',batch:'批量创建',inbox:'旧 IMAP 收件箱', 'local-inbox':'收件箱', docs:'API 文档',logs:'运行日志'};
+                var titles = {dashboard:'仪表盘',emails:'邮箱列表',batch:'批量创建',inbox:'旧 IMAP 收件箱', 'local-inbox':'收件箱',agent:'Agent 提示词',logs:'运行日志'};
                 E('tabTitle').textContent = titles[curTab]||curTab;
                 
                 if(curTab==='emails'){
@@ -1944,7 +1964,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 if(curTab==='batch') renderBatchPanel();
                 if(curTab==='inbox') updateInboxAccountSelect();
                 if(curTab==='local-inbox') refreshLocalInbox();
-                if(curTab==='docs') renderDocs();
+                if(curTab==='agent') renderAgentPrompt();
                 if(curTab==='logs') renderLogs();
             });
         });
@@ -2330,14 +2350,13 @@ UI_HTML = r"""<!DOCTYPE html>
         async function refreshLocalInbox(force){
             if(!E('localAliasTable')) return;
             var q = ((E('localAliasSearch')||{}).value||'').trim();
-            var assignee = ((E('localAssigneeFilter')||{}).value||'').trim();
-            var d = await api('/api/local-inbox/summary?q='+encodeURIComponent(q)+'&assignee='+encodeURIComponent(assignee));
+            var d = await api('/api/local-inbox/summary?q='+encodeURIComponent(q));
             if(!d.ok){
                 E('localAliasTable').innerHTML = '<div class="empty"><div class="icon"></div>'+esc(d.error||'加载失败')+'</div>';
                 return;
             }
             localAliases = d.aliases||[];
-            renderLocalAssigneeFilter(d.assignees||[]);
+            bindLocalInboxSearch();
             renderLocalAliasTable(d.stats||{});
             var selected = localSelectedAlias ? (localAliases.find(function(a){return a.alias===localSelectedAlias}) || {}) : {};
             var fp = [
@@ -2355,15 +2374,7 @@ UI_HTML = r"""<!DOCTYPE html>
             }
         }
 
-        function renderLocalAssigneeFilter(assignees){
-            var sel = E('localAssigneeFilter');
-            if(!sel) return;
-            var old = sel.value || '';
-            var html = '<option value="">全部负责人</option>';
-            assignees.forEach(function(name){ html += '<option value="'+escAttr(name)+'">'+esc(name)+'</option>'; });
-            sel.innerHTML = html;
-            sel.value = old;
-            sel.onchange = function(){ localMsgOffset=0; refreshLocalInbox(true); };
+        function bindLocalInboxSearch(){
             var search = E('localAliasSearch');
             if(search && !search.dataset.bound){
                 search.dataset.bound = '1';
@@ -2375,7 +2386,7 @@ UI_HTML = r"""<!DOCTYPE html>
             var box = E('localAliasTable');
             if(!box) return;
             if(E('localInboxStats')){
-                E('localInboxStats').textContent = '全部邮件 '+(stats.total_mails||0)+' 封 / 已收件邮箱 '+(stats.alias_count||0)+' 个 / 可分发邮箱 '+(stats.known_alias_count||localAliases.length||0)+' 个 / 已启用分享 '+(stats.share_count||0)+' 个';
+                E('localInboxStats').textContent = '全部邮件 '+(stats.total_mails||0)+' 封 / 已收件邮箱 '+(stats.alias_count||0)+' 个 / 已知邮箱 '+(stats.known_alias_count||localAliases.length||0)+' 个';
             }
             var h = '';
             h += '<button class="mail-address-row '+(!localSelectedAlias?'active':'')+'" id="localAllInboxBtn">'
@@ -2390,11 +2401,10 @@ UI_HTML = r"""<!DOCTYPE html>
             localAliases.forEach(function(a){
                 var alias = a.alias || '';
                 var active = alias===localSelectedAlias ? 'active' : '';
-                var assignee = a.assignee || '未分配';
                 var latest = (a.latest_at||'').substring(0,16) || '暂无邮件';
                 h += '<button class="mail-address-row local-address-btn '+active+'" data-alias="'+escAttr(alias)+'">'
                   + '<div class="mail-address-main"><span>'+esc(alias)+'</span><span class="mail-badge">'+(a.mail_count||0)+'</span></div>'
-                  + '<div class="mail-address-meta"><span>'+esc(assignee)+'</span><span>'+esc(latest)+'</span></div>'
+                  + '<div class="mail-address-meta"><span>Local Inbox</span><span>'+esc(latest)+'</span></div>'
                   + '</button>';
             });
             box.innerHTML = h;
@@ -2406,7 +2416,6 @@ UI_HTML = r"""<!DOCTYPE html>
 
         function loadAllLocalInbox(){
             localSelectedAlias = '';
-            localSelectedAccount = '';
             localSelectedMailId = null;
             localMsgOffset = 0;
             if(E('localPreview')) E('localPreview').innerHTML = '<div class="empty"><div class="icon"></div>选择中间列表的一封邮件查看内容</div>';
@@ -2419,8 +2428,6 @@ UI_HTML = r"""<!DOCTYPE html>
             localSelectedAlias = alias;
             localMsgOffset = 0;
             localSelectedMailId = null;
-            var row = localAliases.find(function(a){return a.alias===alias});
-            localSelectedAccount = row ? (row.account_id||'') : '';
             if(E('localPreview')) E('localPreview').innerHTML = '<div class="empty"><div class="icon"></div>选择中间列表的一封邮件查看内容</div>';
             renderLocalAliasTable({total_mails:state.local_mail_count||0, alias_count:state.local_mail_alias_count||0, share_count:state.local_mail_share_count||0, known_alias_count:localAliases.length});
             loadLocalMessages(alias, 0);
@@ -2468,7 +2475,7 @@ UI_HTML = r"""<!DOCTYPE html>
                   + '<div class="mail-subject">'+esc(m.subject||'(无主题)')+'</div>'
                   + '<div class="mail-meta">From: '+esc(m.from||m.sender_name||'')+'</div>'
                   + '<div class="mail-meta">To: '+esc(m.hme_alias||'')+'</div>'
-                  + '<div class="mail-meta">'+esc((m.created_at||'').substring(0,19))+(m.assignee?' · '+esc(m.assignee):'')+'</div>'
+                  + '<div class="mail-meta">'+esc((m.created_at||'').substring(0,19))+'</div>'
                   + '</button>';
             });
             if(localMsgTotal > localMsgLimit){
@@ -2504,22 +2511,16 @@ UI_HTML = r"""<!DOCTYPE html>
             if(!preview) return;
             if(E('localPreviewSub')) E('localPreviewSub').textContent = (m.hme_alias||'') + ' · ' + ((m.created_at||'').substring(0,19));
             var h = '<div class="mail-preview">'
-              + '<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px">'
               + '<h2>'+esc(m.subject||'(无主题)')+'</h2>'
-              + '<button class="copy-btn" id="btnShareCurrentAlias">分配/分享</button>'
-              + '</div>'
               + '<div class="mail-preview-meta">'
               + '<div><b>From:</b> '+esc(m.source_from||m.sender_name||m.from||'')+'</div>'
               + '<div><b>To:</b> '+esc(m.hme_alias||'')+'</div>'
               + '<div><b>Time:</b> '+esc((m.created_at||'').substring(0,19))+'</div>'
-              + (m.assignee?'<div><b>Assignee:</b> '+esc(m.assignee)+'</div>':'')
               + '</div>'
               + '<div class="mail-preview-body" id="localPreviewBody"></div>'
               + '</div>';
             preview.className = '';
             preview.innerHTML = h;
-            var shareBtn = E('btnShareCurrentAlias');
-            if(shareBtn) shareBtn.onclick = function(){ openShareModal(m.hme_alias||''); };
             var body = E('localPreviewBody');
             if(m.html){
                 var iframe = document.createElement('iframe');
@@ -2531,39 +2532,6 @@ UI_HTML = r"""<!DOCTYPE html>
             }else{
                 body.innerHTML = '<pre>'+esc(m.text||'(无正文)')+'</pre>';
             }
-        }
-
-        function openShareModal(alias){
-            var row = localAliases.find(function(a){return a.alias===alias}) || {alias:alias};
-            var h = '<div class="modal-overlay" id="shareModal" onclick="if(event.target===this)closeShareModal()"><div class="modal-box"><h3><i class="diamond"></i> 分配 / 分享收件箱</h3>'
-              + '<p>隐私邮箱: <b>'+esc(alias)+'</b><br>分享链接是只读访问，只能看到这个隐私邮箱的邮件。</p>'
-              + '<input type="hidden" id="shareAlias" value="'+escAttr(alias)+'">'
-              + '<input type="hidden" id="shareAccountId" value="'+escAttr(row.account_id||localSelectedAccount||'')+'">'
-              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">分配给</label><input type="text" id="shareAssignee" value="'+escAttr(row.assignee||'')+'" placeholder="例如 张三 / 客户A">'
-              + '<label style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">备注</label><input type="text" id="shareNote" value="'+escAttr(row.note||'')+'" placeholder="可选">'
-              + '<label style="display:flex;gap:8px;align-items:center;margin-top:8px;font-size:13px"><input type="checkbox" id="shareEnabled" '+(row.share_enabled?'checked':'')+'> 启用分享链接</label>'
-              + (row.share_url?'<div style="margin-top:8px;font-size:11px;word-break:break-all;color:var(--ink-faint)">当前链接: <code>'+esc(row.share_url)+'</code></div>':'')
-              + '<div class="modal-actions"><button class="btn btn-outline" onclick="closeShareModal()">取消</button><button class="btn btn-outline" onclick="saveShare(true)">重置链接</button><button class="btn btn-primary" onclick="saveShare(false)">保存</button></div><div class="modal-msg" id="shareMsg"></div></div></div>';
-            document.body.insertAdjacentHTML('beforeend', h);
-        }
-
-        function closeShareModal(){ var m=E('shareModal'); if(m) m.remove(); }
-
-        async function saveShare(regenerate){
-            var payload = {
-                alias: E('shareAlias').value,
-                account_id: ((E('shareAccountId')||{}).value || localSelectedAccount || ''),
-                assignee: E('shareAssignee').value.trim(),
-                note: E('shareNote').value.trim(),
-                enabled: !!E('shareEnabled').checked,
-                regenerate: !!regenerate
-            };
-            var d = await api('/api/local-inbox/share',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-            if(!d.ok){ E('shareMsg').innerHTML = '<span style="color:var(--red)">'+esc(d.error||'保存失败')+'</span>'; return; }
-            var link = d.share.share_url || '';
-            E('shareMsg').innerHTML = '<span style="color:var(--green)">已保存</span>'+(link?'<div style="word-break:break-all;margin-top:6px"><code>'+esc(link)+'</code></div>':'');
-            if(link) navigator.clipboard.writeText(link).then(function(){ toast('分享链接已复制'); });
-            await refreshLocalInbox(true);
         }
 
         async function openWorkerConfig(){
@@ -3094,74 +3062,85 @@ UI_HTML = r"""<!DOCTYPE html>
             }
         }
         
-        function renderDocs(){
-            var h = '<div style="max-width:900px"><p style="color:var(--ink-soft);margin-bottom:18px">所有接口返回 JSON。Base URL: <code>http://127.0.0.1:5050</code></p>';
-            var sections = [
-                {title:'账号管理',items:[
-                    {method:'GET',path:'/api/accounts',desc:'列出所有账号（脱敏，不含 cookie）'},
-                    {method:'POST',path:'/api/accounts/add',desc:'添加账号',body:'{"name":"账号名","cookie_input":"name1=value1; name2=value2"}'},
-                    {method:'POST',path:'/api/accounts/{id}/cookies',desc:'重新导入指定账号 Cookie 并校验',body:'{"name":"账号名","cookie_input":"name1=value1; name2=value2"}'},
-                    {method:'POST',path:'/api/accounts/{id}/remove',desc:'删除账号'},
-                    {method:'POST',path:'/api/accounts/{id}/validate',desc:'重新校验账号会话'}
-                ]},
-                {title:'状态',items:[
-                    {method:'GET',path:'/api/state',desc:'全局状态 + 账号汇总'},
-                    {method:'GET',path:'/api/settings',desc:'读取全局邮箱设置'},
-                    {method:'GET',path:'/api/forward-options',desc:'读取 Apple 账号已绑定/允许的转发邮箱选项'},
-                    {method:'POST',path:'/api/settings',desc:'保存分裂开关和转发地址选择',body:'{"alias_split_enabled":true,"alias_split_count":4,"forward_to_email":"user@example.com"}'}
-                ]},
-                {title:'别名 / 邮箱',items:[
-                    {method:'GET',path:'/api/aliases',desc:'所有账号的别名列表（iCloud API 实时拉取，并写入云端同步缓存，支持派生地址）'},
-                    {method:'GET',path:'/api/emails',desc:'本地创建记录 + 最近一次云端同步缓存，支持派生地址'},
-                    {method:'POST',path:'/api/accounts/{id}/create',desc:'为指定账号创建别名',body:'{"count":5,"label":"可选标签"}'},
-                    {method:'POST',path:'/api/create-batch',desc:'跨账号批量创建',body:'{"account_ids":["id1","id2"],"count_per_account":5}'}
-                ]},
-                {title:'收件箱 (IMAP)',items:[
-                    {method:'GET',path:'/api/accounts/{id}/inbox?limit=20&force=1',desc:'查收件箱。force=1 跳过缓存强制从 IMAP 拉取'},
-                    {method:'GET',path:'/api/accounts/{id}/alias-mail?force=1',desc:'查所有隐私别名的收件情况'},
-                    {method:'GET',path:'/api/accounts/{id}/mail/{别名邮箱}',desc:'查指定隐私邮箱的收件'},
-                    {method:'POST',path:'/api/accounts/{id}/app-password',desc:'设置 App 专用密码并测试 IMAP',body:'{"app_password":"xxxx-xxxx-xxxx-xxxx","icloud_email":"xxx@icloud.com"}'}
-                ]},
-                {title:'本机收件箱 / 分享',items:[
-                    {method:'GET',path:'/api/inbound-config',desc:'读取 Cloudflare Email Worker 投递地址和 token'},
-                    {method:'POST',path:'/api/inbound-mail',desc:'Cloudflare Worker 投递原始邮件（Bearer token 认证）',body:'{"from":"sender@example.com","to":"inbox@mail.example.com","raw":"完整 RFC822 邮件","headers":{}}'},
-                    {method:'GET',path:'/api/local-inbox/summary',desc:'按隐私邮箱统计本机收到的邮件，并返回分享状态'},
-                    {method:'GET',path:'/api/local-inbox/messages?alias=xxx@icloud.com',desc:'查看某个隐私邮箱的独立收件箱'},
-                    {method:'POST',path:'/api/local-inbox/share',desc:'给某个隐私邮箱分配负责人并生成只读分享链接',body:'{"alias":"xxx@icloud.com","assignee":"客户A","enabled":true}'},
-                    {method:'GET',path:'/share/{token}',desc:'外部分发人员只读分享页面'}
-                ]},
-                {title:'快捷入口',items:[
-                    {method:'GET',path:'/api/mail?email=user@icloud.com',desc:'按主邮箱查所有别名收件'},
-                    {method:'GET',path:'/api/mail?email=...&alias=xxx@icloud.com',desc:'按主邮箱查指定别名收件'}
-                ]},
-                {title:'调度器',items:[
-                    {method:'GET',path:'/api/scheduler/config',desc:'读取当前计划任务配置'},
-                    {method:'POST',path:'/api/scheduler/config',desc:'保存计划任务配置',body:'{"mode":"interval","interval_minutes":30,"count_per_run":1}'},
-                    {method:'POST',path:'/api/scheduler/start',desc:'按当前配置启动定时调度器'},
-                    {method:'POST',path:'/api/scheduler/stop',desc:'停止调度器'}
-                ]},
-                {title:'实时日志',items:[
-                    {method:'GET',path:'/api/log-stream',desc:'SSE 实时日志流（EventSource）'}
-                ]}
+        function renderAgentPrompt(){
+            var baseInput = E('agentBaseUrl');
+            var tokenInput = E('agentAdminToken');
+            var includeToken = E('agentIncludeToken');
+            if(!baseInput || !tokenInput || !includeToken || !E('agentPromptText')) return;
+            if(!baseInput.value) baseInput.value = location.origin;
+            if(!tokenInput.value) tokenInput.value = localStorage.getItem('icloud_admin_auth') || '';
+            var base = (baseInput.value || location.origin).replace(/\/$/,'');
+            var token = includeToken.checked ? (tokenInput.value || '<ADMIN_TOKEN>') : '<ADMIN_TOKEN>';
+            var lines = [
+                '你是 iCloud HME Mail 系统的自动化管理 Agent。请通过 HTTP API 操作系统，不要猜测页面状态。',
+                '',
+                '【连接信息】',
+                'Base URL: ' + base,
+                'Admin API Token: ' + token,
+                '认证方式：所有管理员接口添加请求头 x-admin-auth: <Admin API Token>。该 Token 等同完整管理员权限，不得在日志、回复或代码仓库中泄露。',
+                '',
+                '【开始工作时必须执行】',
+                '1. GET /api/state：确认服务、调度器、账号和本机收件状态。',
+                '2. GET /api/accounts：获取 iCloud 账号列表及 active/error 状态。',
+                '3. GET /api/emails：获取本地邮箱和派生 +tag 地址列表。',
+                '4. GET /api/local-inbox/summary：获取所有本机收件邮箱与邮件数量。',
+                '只汇报必要的脱敏摘要，不输出 Cookie、Admin Token、INBOUND_TOKEN、Address JWT 或完整邮件原文。',
+                '',
+                '【邮箱与登录链接】',
+                '- GET /admin/address?limit=500&offset=0：分页读取凭证地址表。需要与 iCloud/本地记录同步时加 sync=1。',
+                '- GET /admin/address_credential?address=<URL编码邮箱>：为指定邮箱生成 Address JWT 和 login_url。给用户时优先返回 login_url，不使用旧的分享/分配功能。',
+                '- GET /admin/export_credentials.csv：导出全部邮箱凭证。',
+                '- GET /api/aliases：主动从 iCloud 同步真实 HME 别名并生成派生地址；该请求可能较慢。',
+                '- GET /api/emails：快速读取本地记录和最近缓存。',
+                '',
+                '【收件箱】',
+                '- GET /api/local-inbox/messages?limit=50&offset=0：管理员读取全部本机邮件。',
+                '- GET /api/local-inbox/messages?alias=<URL编码邮箱>&limit=50：读取指定邮箱 family 收件箱。',
+                '- GET /api/local-inbox/messages/<mail_id>：读取单封邮件正文。',
+                '- +tag 地址使用 family 模式：查询 xxx+3@icloud.com 时也会包含落到 xxx@icloud.com 的邮件，避免 Apple/发送方去掉 +tag 后漏信。',
+                '- 普通用户可打开 login_url，或使用 Authorization: Bearer <Address JWT> 调用 /api/parsed_mails 和 /api/parsed_mail/<id>。',
+                '',
+                '【创建与账号管理】',
+                '- POST /api/accounts/<account_id>/create，JSON {"count":1,"label":"可选"}：指定账号创建 HME。',
+                '- POST /api/create-batch，JSON {"account_ids":["id1"],"count_per_account":1,"label":"可选"}：跨账号批量创建。',
+                '- POST /api/accounts/<account_id>/validate：校验 iCloud 会话。',
+                '- POST /api/accounts/<account_id>/cookies，JSON {"name":"账号名","cookie_input":"用户提供的新 Cookie"}：更新 Cookie。只在用户明确提供 Cookie 时使用。',
+                '- POST /api/accounts/<account_id>/remove：删除本系统保存的账号配置，不删除 Apple 中已有 HME；执行前必须获得用户确认。',
+                '',
+                '【全局设置与自动化】',
+                '- GET /api/settings：读取全局设置。',
+                '- GET /api/forward-options：读取 Apple 账号允许的转发地址。',
+                '- POST /api/settings：保存 alias_split_enabled、alias_split_count、forward_to_email。',
+                '- GET /api/scheduler/config：读取计划任务。',
+                '- POST /api/scheduler/config：保存计划任务。',
+                '- POST /api/scheduler/start：启动计划任务。',
+                '- POST /api/scheduler/stop：停止计划任务。',
+                '- GET /api/logs：读取近期运行日志；只摘录决定性错误，禁止回显凭证。',
+                '',
+                '【操作规则】',
+                '1. 先读取状态，再执行修改；一次只改变一个变量并验证返回 JSON。',
+                '2. 创建、删除、重置 Token、更新 Cookie、清空邮件等高影响操作必须先说明影响并获得用户确认。',
+                '3. API 返回非 2xx 时，记录 status、error/detail 和最小复现步骤，不要盲目重试。',
+                '4. 邮箱列表优先使用 /api/emails；需要最新 Apple 状态时才调用 /api/aliases 或 sync=1。',
+                '5. 用户收件访问统一发 login_url；不要创建重复的分享链接或负责人分配。',
+                '6. 完成操作后再次 GET /api/state，并给出：结果、关键证据、验证、下一步。',
+                '',
+                '现在先连接系统并执行只读检查：/api/state、/api/accounts、/api/emails、/api/local-inbox/summary。不要立即修改任何配置。'
             ];
-            
-            sections.forEach(function(sec){
-                h += '<div style="margin-bottom:24px"><div style="font-size:12px;color:var(--ink-faint);letter-spacing:.2em;text-transform:uppercase;margin-bottom:10px;border-bottom:1px solid var(--rule);padding-bottom:4px">'+esc(sec.title)+'</div>';
-                sec.items.forEach(function(item){
-                    var methodColor = item.method==='GET'?'var(--green)':item.method==='POST'?'var(--red)':'var(--ink-soft)';
-                    h += '<div style="margin-bottom:10px;padding:10px 14px;background:var(--paper-dim)"><span style="font-weight:700;color:'+methodColor+';margin-right:12px;font-size:11px">'+item.method+'</span><code style="font-size:12px">'+esc(item.path)+'</code><div style="color:var(--ink-soft);font-size:12px;margin-top:4px">'+esc(item.desc)+'</div>';
-                    if(item.body){
-                        h += '<div style="margin-top:6px"><code style="font-size:11px;color:var(--ink-faint);background:var(--paper);padding:3px 8px;display:inline-block">'+esc(item.body)+'</code></div>';
-                    }
-                    h += '</div>';
-                });
-                h += '</div>';
-            });
-            
-            h += '<div style="margin-top:32px;padding-top:16px;border-top:1px solid var(--rule-strong);font-size:12px;color:var(--ink-faint)">缓存策略：收件箱接口默认 5 分钟内读本地缓存 (<code>results/mail_cache.json</code>)，首次拉取后终身存储。传 <code>?force=1</code> 跳过缓存从 IMAP 增量拉取。<br>Cookie 导入：支持 Header String (<code>name=value; ...</code>) 和 JSON (<code>{"name":"value"}</code>) 两种格式。</div></div>';
-            E('docsContent').innerHTML = h;
+            E('agentPromptText').value = lines.join('\n');
         }
-        
+
+        function copyAgentPrompt(){
+            renderAgentPrompt();
+            var value = (E('agentPromptText')||{}).value || '';
+            if(!value){ toast('提示词为空',true); return; }
+            navigator.clipboard.writeText(value).then(function(){ toast('Agent 提示词已复制'); }).catch(function(){
+                E('agentPromptText').focus();
+                E('agentPromptText').select();
+                toast('无法自动复制，已选中全文',true);
+            });
+        }
+
         function updateInboxAccountSelect(){
             var sel = E('inboxAccount'), old = sel.value;
             sel.innerHTML = '<option value="">-- 选择账号 --</option>';
