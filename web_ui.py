@@ -4,11 +4,12 @@
 import sys, os, json, time, queue, secrets, threading, csv, io, sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
-from flask import Flask, Response, request, jsonify, render_template_string, redirect, make_response
+from flask import Flask, Response, request, jsonify, render_template_string, redirect, make_response, send_file
 from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from inbound_mail import InboundMailStore
@@ -1894,6 +1895,7 @@ UI_HTML = r"""<!DOCTYPE html>
                     <div style="display:flex;gap:8px">
                         <button class="btn btn-outline btn-sm" onclick="renderAgentPrompt()">重新生成</button>
                         <button class="btn btn-primary btn-sm" onclick="copyAgentPrompt()">复制提示词</button>
+                        <a class="btn btn-outline btn-sm" href="/admin/download_skill">下载 Skill</a>
                     </div>
                 </div>
                 <div class="panel-body" style="padding:20px 24px">
@@ -3526,6 +3528,28 @@ def admin_login_page():
     if _admin_auth_ok():
         return make_response(render_template_string(UI_HTML))
     return render_template_string(ADMIN_LOGIN_HTML)
+
+@app.route("/admin/download_skill")
+def admin_download_skill():
+    """下载不含运行时密钥的 Admin Skill 压缩包。"""
+    skill_dir = HERE / "skills" / "icloud-hme-admin"
+    if not skill_dir.is_dir():
+        return jsonify({"ok": False, "error": "skill package is not installed"}), 404
+    archive = io.BytesIO()
+    with ZipFile(archive, "w", ZIP_DEFLATED) as zf:
+        for path in sorted(skill_dir.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            rel = path.relative_to(skill_dir).as_posix()
+            zf.write(path, f"icloud-hme-admin/{rel}")
+    archive.seek(0)
+    return send_file(
+        archive,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="icloud-hme-admin-skill.zip",
+        max_age=0,
+    )
 
 @app.route("/user")
 def user_inbox_page():
