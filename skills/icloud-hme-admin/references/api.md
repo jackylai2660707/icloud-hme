@@ -48,10 +48,33 @@ For create/delete operations, confirm exact account/address and count first. `/a
 | GET | `/api/local-inbox/messages?limit=50&offset=0` | All local messages, metadata |
 | GET | `/api/local-inbox/messages?alias=xxx%40icloud.com&limit=50&offset=0` | Family mailbox query |
 | GET | `/api/local-inbox/messages/{id}` | Full parsed message; fetch only when needed |
+| GET | `/api/mail-analysis` | Mail categories and per-mailbox ChatGPT status; cached for 5 minutes |
+| GET | `/api/mail-analysis?refresh=1` | Force a fresh local analysis |
 | GET | `/api/inbound-config` | Worker config; contains sensitive inbound token, never print |
 | GET | `/api/logs` | Recent application logs; summarize only |
 
 Family query semantics: `alias=xxx+3@icloud.com` matches `hme_alias=xxx+3@icloud.com` or `base_alias=xxx@icloud.com`. This is intentional because upstream forwarding can remove the plus tag.
+
+`/api/mail-analysis` 返回类似：
+
+```json
+{
+  "messages_total": 3651,
+  "status_counts": {"free": 0, "plus": 0, "deactivated": 0, "unknown": 0},
+  "mailbox_status": [
+    {
+      "mailbox": "xxx+3@icloud.com",
+      "family": "xxx@icloud.com",
+      "status_scope": "family",
+      "status": "free",
+      "confidence": "medium",
+      "evidence_ids": [123]
+    }
+  ]
+}
+```
+
+`status` 是邮件内容启发式结果，不是 ChatGPT 官方账户接口；`unknown` 必须保留，不能强行当成 `free`。
 
 Legacy share routes remain for old links but should not be created for new workflows:
 

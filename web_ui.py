@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """iCloud HME Web UI — 多账号聚合管理平台 — Flask single-page app."""
-import sys, os, json, time, queue, secrets, threading, csv, io, sqlite3
+import sys, os, json, time, queue, secrets, threading, csv, io, sqlite3, re, html as html_lib
 from datetime import datetime, timedelta
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -49,6 +49,8 @@ _scheduler_config = {}
 _scheduler_runtime = {"rr_index":0}
 _app_settings = {}
 _inbound_config = {}
+_mail_analysis_cache = {"at": 0.0, "data": None}
+_mail_analysis_cache_lock = threading.Lock()
 ADMIN_COOKIE_NAME = "icloud_admin_auth"
 
 _RATE_LIMIT_KW = ["limit","exceeded","maximum","quota","429","too many","try again","unavailable","上限","超过","过多","频繁","rate limit","throttle","blocked"]
@@ -506,6 +508,149 @@ def _get_cf_mail(mail_id: int, addresses: list, include_raw: bool = True, parsed
             [int(mail_id)] + where_params,
         ).fetchone()
     return _cf_mail_row(dict(row), include_raw=include_raw, parsed=parsed) if row else None
+
+_ANALYSIS_CHATGPT_RE = re.compile(r"(?i)\b(chatgpt|openai|codex)\b")
+_ANALYSIS_DEACTIVATED = [
+    r"account\s+(?:has been\s+)?deactivated", r"access\s+deactivated",
+    r"account\s+(?:has been\s+)?disabled", r"account\s+suspended",
+    r"suspension", r"账号已停用", r"账户已停用", r"账号被停用", r"无法访问(?:你的|您的)?账户",
+]
+_ANALYSIS_PLUS = [
+    r"chatgpt\s*plus", r"plus\s+subscription", r"subscription\s+(?:is\s+)?active",
+    r"manage\s+your\s+subscription", r"upgrade\s+(?:to|your)\s+plus",
+    r"升级至\s*plus", r"plus\s*订阅", r"订阅已生效",
+]
+_ANALYSIS_FREE = [
+    r"temporary\s+(?:login|verification)\s+code", r"verification\s+code", r"login\s+code",
+    r"临时(?:登录|验证码|认证)代码", r"验证码", r"welcome\s+to\s+chatgpt", r"chatgpt\s+登录",
+]
+
+def _analysis_strip_html(value: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))).strip()
+
+def _analysis_normalize_subject(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{16,}\b", "<id>", text, flags=re.I)
+    text = re.sub(r"\b\d{4,}\b", "<code>", text)
+    return text or "(no subject)"
+
+def _analysis_sender_domain(value: str) -> str:
+    match = re.findall(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", str(value or ""))
+    return match[-1].rsplit("@", 1)[-1].lower() if match else "unknown"
+
+def _analysis_status(text: str):
+    text = str(text or "")
+    for pattern in _ANALYSIS_DEACTIVATED:
+        if re.search(pattern, text, re.I):
+            return "deactivated", "high"
+    for pattern in _ANALYSIS_PLUS:
+        if re.search(pattern, text, re.I):
+            return "plus", "high"
+    if _ANALYSIS_CHATGPT_RE.search(text) and any(re.search(pattern, text, re.I) for pattern in _ANALYSIS_FREE):
+        return "free", "medium"
+    return None, "low"
+
+def _build_mail_analysis(force: bool = False) -> dict:
+    now = time.time()
+    with _mail_analysis_cache_lock:
+        cached = _mail_analysis_cache.get("data")
+        if cached and not force and now - float(_mail_analysis_cache.get("at") or 0) < 300:
+            result = dict(cached)
+            result["cached"] = True
+            result["cache_age_sec"] = int(now - float(_mail_analysis_cache.get("at") or now))
+            return result
+
+        with _inbound_store._lock, _inbound_store._connect() as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT id, hme_alias, base_alias, subject, source_from, created_at, text, html FROM inbound_mails ORDER BY id DESC"
+            ).fetchall()]
+
+        known_addresses = set()
+        for record in _known_alias_records_for_inbound():
+            email = norm_email(record.get("email"))
+            if email:
+                known_addresses.add(email)
+
+        categories = {}
+        evidence = {}
+        chat_candidates = 0
+        for row in rows:
+            alias = norm_email(row.get("hme_alias"))
+            family = norm_email(row.get("base_alias") or _base_plus_email(alias))
+            if alias:
+                known_addresses.add(alias)
+            subject = str(row.get("subject") or "(no subject)")
+            sender = str(row.get("source_from") or "")
+            norm_subject = _analysis_normalize_subject(subject)
+            domain = _analysis_sender_domain(sender)
+            text = " ".join([subject, sender, str(row.get("text") or ""), _analysis_strip_html(row.get("html") or "")])
+            lower = text.lower()
+            if _ANALYSIS_CHATGPT_RE.search(text):
+                chat_candidates += 1
+                status, confidence = _analysis_status(text)
+                if status:
+                    evidence.setdefault(family, []).append({
+                        "status": status, "confidence": confidence, "id": int(row["id"]),
+                        "created_at": row.get("created_at") or "", "alias": alias,
+                    })
+            if _ANALYSIS_CHATGPT_RE.search(lower):
+                category = "ChatGPT/OpenAI"
+            elif re.search(r"(?i)code|验证码|verification|login|登录|otp", lower):
+                category = "登录/验证码"
+            elif re.search(r"(?i)subscription|billing|invoice|receipt|订阅|账单|付款|支付", lower):
+                category = "订阅/账单"
+            elif re.search(r"(?i)security|alert|password|安全|密码|警告", lower):
+                category = "安全通知"
+            elif re.search(r"(?i)invite|invitation|邀请", lower):
+                category = "邀请/协作"
+            else:
+                category = "其它"
+            key = f"{domain}|{norm_subject}"
+            item = categories.setdefault(key, {
+                "category": category, "subject": norm_subject, "sender_domain": domain,
+                "count": 0, "sample_ids": [],
+            })
+            item["count"] += 1
+            if len(item["sample_ids"]) < 5:
+                item["sample_ids"].append(int(row["id"]))
+
+        families = {}
+        for address in known_addresses:
+            families.setdefault(_base_plus_email(address), set()).add(address)
+        for family, items in evidence.items():
+            families.setdefault(family, set()).update(item["alias"] for item in items if item.get("alias"))
+
+        mailbox_status = []
+        for family, aliases in sorted(families.items()):
+            items = sorted(evidence.get(family, []), key=lambda x: (x.get("created_at") or "", x.get("id", 0)), reverse=True)
+            latest = items[0] if items else None
+            for mailbox in sorted(aliases):
+                mailbox_status.append({
+                    "mailbox": mailbox, "family": family, "status_scope": "family",
+                    "status": latest["status"] if latest else "unknown",
+                    "confidence": latest["confidence"] if latest else "low",
+                    "evidence_ids": [item["id"] for item in items[:10]],
+                    "latest_evidence_at": latest.get("created_at", "") if latest else "",
+                    "note": "+tag 可能被上游去掉，状态按 family 统计" if any("+" in a.rsplit("@", 1)[0] for a in aliases) else "",
+                })
+
+        category_rows = sorted(categories.values(), key=lambda x: (-x["count"], x["subject"]))[:200]
+        status_counts = {}
+        for item in mailbox_status:
+            status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+        result = {
+            "ok": True, "analysis_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "messages_total": len(rows), "chatgpt_candidate_messages": chat_candidates,
+            "categories": category_rows, "mailbox_status": mailbox_status,
+            "status_counts": status_counts, "cached": False, "cache_age_sec": 0,
+            "warnings": [
+                "状态来自邮件内容启发式分析，不是 ChatGPT 官方订阅接口。",
+                "+tag 地址按 family 统计；上游去掉 +tag 时无法恢复精确归属。",
+            ],
+        }
+        _mail_analysis_cache["at"] = now
+        _mail_analysis_cache["data"] = result
+        return result
 
 def _list_all_cf_mails(
     limit: int = 50,
@@ -1250,6 +1395,20 @@ UI_HTML = r"""<!DOCTYPE html>
         .email-table tr:hover td {
             background: var(--paper-dim);
         }
+        .mail-status {
+            display: inline-block;
+            min-width: 76px;
+            padding: 4px 8px;
+            border: 1px solid currentColor;
+            border-radius: 999px;
+            text-align: center;
+            font-size: 11px;
+            font-family: var(--mono);
+        }
+        .mail-status.free { color: var(--green); }
+        .mail-status.plus { color: var(--blue); }
+        .mail-status.deactivated { color: var(--red); }
+        .mail-status.unknown { color: var(--ink-faint); }
         .email-item:hover {
             background: var(--paper-dim);
         }
@@ -1777,6 +1936,7 @@ UI_HTML = r"""<!DOCTYPE html>
                         <button class="btn btn-outline btn-sm" onclick="copyAll()">复制全部</button>
                         <button class="btn btn-outline btn-sm" onclick="exportCSV()">CSV</button>
                         <button class="btn btn-primary btn-sm" onclick="exportCredentials()">导出凭证</button>
+                        <button class="btn btn-outline btn-sm" onclick="refreshMailAnalysis(true)">分析账户状态</button>
                     </div>
                 </div>
                 <div class="filter-bar">
@@ -1784,9 +1944,14 @@ UI_HTML = r"""<!DOCTYPE html>
                     <select id="aliasFilter" onchange="_aliasPage=1;renderAliasTable()">
                         <option value="all">全部账号</option>
                     </select>
+                    <span style="font-size:11px;color:var(--ink-faint)">ChatGPT:</span>
+                    <select id="mailStatusFilter" onchange="_aliasPage=1;renderAliasTable()">
+                        <option value="all">全部状态</option>
+                    </select>
                     <span style="font-size:11px;color:var(--ink-faint)">搜索:</span>
                     <input id="aliasSearch" type="search" placeholder="邮箱 / 标签 / 账号" oninput="_aliasPage=1;renderAliasTable()" style="min-width:260px">
                 </div>
+                <div id="mailAnalysisSummary" style="font-size:12px;color:var(--ink-faint);padding:0 14px 10px">账户状态尚未分析；点击“分析账户状态”获取结果。</div>
                 <div class="panel-body">
                     <div id="aliasTableContainer" class="empty">
                         <div class="icon"></div>暂无创建记录 — 请先通过仪表盘或批量创建生成邮箱
@@ -1937,7 +2102,7 @@ UI_HTML = r"""<!DOCTYPE html>
     <script>
         var E = function(id){ return document.getElementById(id); };
         var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:false,alias_split_count:4,forward_to_email:''};
-        var accounts = [], emails = [], logs = [];
+        var accounts = [], emails = [], logs = [], mailAnalysis = null, mailStatusMap = {};
         var forwardOptions = {loaded:false,loading:false,emails:[],selected:'',current:'',accounts:[],error:''};
         var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false, localInboxFingerprint = '';
         var curTab = 'dashboard', sseConn = null;
@@ -2118,6 +2283,7 @@ UI_HTML = r"""<!DOCTYPE html>
                     await refreshForwardOptions(false);
                 }
                 await refreshEmails();
+                await refreshMailAnalysis(false);
                 if(curTab==='emails'){
                     renderAliasTable();
                 }
@@ -2250,6 +2416,42 @@ UI_HTML = r"""<!DOCTYPE html>
             });
             sel.value = old||'all';
         }
+
+        function mailStatusText(status){
+            return ({free:'Free',plus:'Plus',deactivated:'Deactivated',unknown:'Unknown'})[status] || '未分析';
+        }
+
+        function mailStatusClass(status){
+            return ({free:'free',plus:'plus',deactivated:'deactivated',unknown:'unknown'})[status] || 'unknown';
+        }
+
+        function updateMailStatusFilter(){
+            var sel = E('mailStatusFilter');
+            if(!sel) return;
+            var old = sel.value || 'all';
+            var counts = (mailAnalysis && mailAnalysis.status_counts) || {};
+            sel.innerHTML = '<option value="all">全部状态</option>'
+                + ['free','plus','deactivated','unknown'].map(function(s){ return '<option value="'+s+'">'+mailStatusText(s)+' ('+(counts[s]||0)+')</option>'; }).join('');
+            sel.value = old;
+        }
+
+        async function refreshMailAnalysis(force){
+            var d = await api('/api/mail-analysis'+(force?'?refresh=1':''), {timeout:120000});
+            if(!d.ok){
+                if(E('mailAnalysisSummary')) E('mailAnalysisSummary').textContent = '账户状态分析失败: '+(d.error||'未知错误');
+                return false;
+            }
+            mailAnalysis = d;
+            mailStatusMap = {};
+            (d.mailbox_status||[]).forEach(function(item){ mailStatusMap[String(item.mailbox||'').toLowerCase()] = item; });
+            updateMailStatusFilter();
+            if(E('mailAnalysisSummary')){
+                var c = d.status_counts||{};
+                E('mailAnalysisSummary').textContent = 'ChatGPT 状态: Free '+(c.free||0)+' / Plus '+(c.plus||0)+' / Deactivated '+(c.deactivated||0)+' / Unknown '+(c.unknown||0)+' · '+(d.messages_total||0)+' 封邮件 · '+(d.cached?'缓存 '+(d.cache_age_sec||0)+' 秒':'刚刚分析');
+            }
+            renderAliasTable();
+            return true;
+        }
         
         var _aliasPage = 1;
         var _aliasPerPage = 20;
@@ -2257,10 +2459,14 @@ UI_HTML = r"""<!DOCTYPE html>
         function getFilteredAliases(){
             var filterEl = E('aliasFilter');
             var filter = filterEl ? filterEl.value : 'all';
+            var statusFilterEl = E('mailStatusFilter');
+            var statusFilter = statusFilterEl ? statusFilterEl.value : 'all';
             var qEl = E('aliasSearch');
             var q = (qEl ? qEl.value : '').trim().toLowerCase();
             return emails.filter(function(e){
                 if(filter !== 'all' && e.account_id !== filter) return false;
+                var status = (mailStatusMap[String(e.email||'').toLowerCase()]||{}).status || 'unknown';
+                if(statusFilter !== 'all' && status !== statusFilter) return false;
                 if(!q) return true;
                 var hay = [
                     e.email || '',
@@ -2295,11 +2501,14 @@ UI_HTML = r"""<!DOCTYPE html>
             if(_aliasPage < 1) _aliasPage = 1;
             if(_aliasPage > totalPages) _aliasPage = totalPages;
             var pageItems = filtered.slice((_aliasPage-1)*_aliasPerPage, _aliasPage*_aliasPerPage);
-            var h = '<table class="email-table"><thead><tr><th>#</th><th>邮箱地址</th><th>所属账号</th><th>标签</th><th>状态</th><th></th></tr></thead><tbody>';
+            var h = '<table class="email-table"><thead><tr><th>#</th><th>邮箱地址</th><th>ChatGPT 状态</th><th>所属账号</th><th>标签</th><th>HME</th><th></th></tr></thead><tbody>';
             pageItems.forEach(function(e,i){
                 var accName = e.account_name||e.account_email||e.account_id||'--';
-                var statusHtml = e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">活跃</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--ink-faint)">--</span>';
-                h += '<tr><td style="color:var(--ink-faint);width:40px">'+((_aliasPage-1)*_aliasPerPage+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td style="font-size:11px">'+esc(accName)+'</td><td style="font-size:11px;color:var(--ink-faint)">'+esc((e.label||'').substring(0,30))+'</td><td>'+statusHtml+'</td><td style="width:132px"><button class="copy-btn" onclick="copyOne(\''+escAttr(e.email)+'\')" title="复制邮箱">复制</button> <button class="copy-btn" onclick="copyAutoLogin(\''+escAttr(e.email)+'\',\''+escAttr(e.account_id||'')+'\',\''+escAttr(e.label||'')+'\')" title="生成并复制自动登录链接">登录链接</button></td></tr>';
+                var chatStatus = mailStatusMap[String(e.email||'').toLowerCase()]||{};
+                var status = chatStatus.status || 'unknown';
+                var statusHtml = '<span class="mail-status '+mailStatusClass(status)+'" title="'+escAttr((chatStatus.note||'')+' 证据: '+((chatStatus.evidence_ids||[]).join(',')))+'">'+mailStatusText(status)+'</span>';
+                var hmeHtml = e.hasOwnProperty('active')?(e.active?'<span style="color:var(--green)">活跃</span>':'<span style="color:var(--red)">停用</span>'):'<span style="color:var(--ink-faint)">--</span>';
+                h += '<tr><td style="color:var(--ink-faint);width:40px">'+((_aliasPage-1)*_aliasPerPage+i+1)+'</td><td class="mono">'+esc(e.email||'')+'</td><td>'+statusHtml+'</td><td style="font-size:11px">'+esc(accName)+'</td><td style="font-size:11px;color:var(--ink-faint)">'+esc((e.label||'').substring(0,30))+'</td><td>'+hmeHtml+'</td><td style="width:132px"><button class="copy-btn" onclick="copyOne(\''+escAttr(e.email)+'\')" title="复制邮箱">复制</button> <button class="copy-btn" onclick="copyAutoLogin(\''+escAttr(e.email)+'\',\''+escAttr(e.account_id||'')+'\',\''+escAttr(e.label||'')+'\')" title="生成并复制自动登录链接">登录链接</button></td></tr>';
             });
             h += '</tbody></table>';
             if(totalPages > 1){
@@ -3099,6 +3308,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '- GET /api/local-inbox/messages?limit=50&offset=0：管理员读取全部本机邮件。',
                 '- GET /api/local-inbox/messages?alias=<URL编码邮箱>&limit=50：读取指定邮箱 family 收件箱。',
                 '- GET /api/local-inbox/messages/<mail_id>：读取单封邮件正文。',
+                '- GET /api/mail-analysis：获取高频邮件分类和每个邮箱/family 的 ChatGPT 状态；加 ?refresh=1 强制刷新。',
                 '- +tag 地址使用 family 模式：查询 xxx+3@icloud.com 时也会包含落到 xxx@icloud.com 的邮件，避免 Apple/发送方去掉 +tag 后漏信。',
                 '- 普通用户可打开 login_url，或使用 Authorization: Bearer <Address JWT> 调用 /api/parsed_mails 和 /api/parsed_mail/<id>。',
                 '',
@@ -4292,6 +4502,15 @@ def api_emails():
         "base_count": sum(1 for e in emails if not e.get("derived")),
         "cloud_cache_count": len(cloud_records),
     })
+
+@app.route("/api/mail-analysis")
+def api_mail_analysis():
+    """返回邮件分类和每个邮箱的 ChatGPT 状态；结果缓存 5 分钟。"""
+    try:
+        return jsonify(_build_mail_analysis(force=request.args.get("refresh", "0") == "1"))
+    except Exception as e:
+        _emit_log("warn", f"邮件分析失败: {str(e)[:160]}")
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
 @app.route("/api/inbound-config", methods=["GET", "POST"])
 def api_inbound_config():

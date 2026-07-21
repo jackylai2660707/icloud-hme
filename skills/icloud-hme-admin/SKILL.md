@@ -45,6 +45,7 @@ x-admin-auth: $ICLOUD_HME_ADMIN_TOKEN
 - **设置**：`GET/POST /api/settings`；转发地址先读 `/api/forward-options`；只选择 Apple 账号已允许的地址。
 - **计划任务**：先读 `/api/scheduler/config`，保存使用同一路径，启停分别使用 `/api/scheduler/start` 和 `/api/scheduler/stop`。停止后确认 `running=false`、`stopping=false`。
 - **日志**：`GET /api/logs` 只提取决定性错误；不要复制包含凭证或邮件内容的日志行。
+- **状态分析 API**：`GET /api/mail-analysis` 返回高频邮件类别、每个邮箱/family 的 ChatGPT 状态、证据 ID 和置信度；加 `refresh=1` 强制重新分析，默认缓存 5 分钟。
 
 ## `+tag` family 规则
 
