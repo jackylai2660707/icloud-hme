@@ -5,6 +5,7 @@ import sys
 import json
 import os
 import tempfile
+import importlib.util
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -207,6 +208,21 @@ def test_inbound_family_share_does_not_miss_base_mail():
     print("  PASS test_inbound_family_share_does_not_miss_base_mail")
 
 
+def test_icloud_hme_skill_mail_analysis_heuristics():
+    """Skill 分析脚本能区分 ChatGPT free/plus/deactivated 信号。"""
+    path = HERE / "skills" / "icloud-hme-admin" / "scripts" / "analyze_mail.py"
+    spec = importlib.util.spec_from_file_location("icloud_hme_skill_analysis", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.base_alias("demo+3@icloud.com") == "demo@icloud.com"
+    assert module.detect_status("Your temporary ChatGPT verification code") == "free"
+    assert module.detect_status("ChatGPT Plus subscription is active") == "plus"
+    assert module.detect_status("OpenAI account has been deactivated") == "deactivated"
+    assert module.detect_status("unrelated newsletter") is None
+    print("  PASS test_icloud_hme_skill_mail_analysis_heuristics")
+
+
 if __name__ == "__main__":
     tests = [
         ("parse_cookie_header_string", test_parse_cookie_header_string),
@@ -222,6 +238,7 @@ if __name__ == "__main__":
         ("cf_credential_normalize_and_id_fallback", test_cf_credential_normalize_and_id_fallback),
         ("inbound_detect_plus_recipient_without_known_alias", test_inbound_detect_plus_recipient_without_known_alias),
         ("inbound_family_share_does_not_miss_base_mail", test_inbound_family_share_does_not_miss_base_mail),
+        ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     
     passed = 0

@@ -1,0 +1,4 @@
+interface:
+  display_name: "iCloud HME 管理与分析"
+  short_description: "管理 iCloud HME 邮箱、收件箱、邮件分类与分析"
+  default_prompt: "使用 $icloud-hme-admin 管理 iCloud HME 邮箱、收件箱、计划任务并分析邮件。"

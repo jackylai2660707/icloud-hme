@@ -3103,6 +3103,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '【创建与账号管理】',
                 '- POST /api/accounts/<account_id>/create，JSON {"count":1,"label":"可选"}：指定账号创建 HME。',
                 '- POST /api/create-batch，JSON {"account_ids":["id1"],"count_per_account":1,"label":"可选"}：跨账号批量创建。',
+                '- POST /api/accounts/<account_id>/alias-delete，JSON {"email":"xxx@icloud.com"}：删除真实 Apple HME；不能删除本地 +tag 派生地址。执行前必须确认，并默认保留本机历史邮件。',
                 '- POST /api/accounts/<account_id>/validate：校验 iCloud 会话。',
                 '- POST /api/accounts/<account_id>/cookies，JSON {"name":"账号名","cookie_input":"用户提供的新 Cookie"}：更新 Cookie。只在用户明确提供 Cookie 时使用。',
                 '- POST /api/accounts/<account_id>/remove：删除本系统保存的账号配置，不删除 Apple 中已有 HME；执行前必须获得用户确认。',
@@ -4075,6 +4076,46 @@ def api_create_for_account(acc_id):
         _update_state(creating=False)
         _emit_log("error", f"[{acc_name}] 手动创建异常: {str(e)[:100]}")
         return jsonify({"ok":False,"error":str(e)})
+
+@app.route("/api/accounts/<acc_id>/alias-delete", methods=["POST"])
+def api_account_alias_delete(acc_id):
+    """删除真实 Apple HME 别名；派生 +tag 地址不能作为真实别名删除。"""
+    data = request.get_json(silent=True) or {}
+    email = norm_email(data.get("email") or data.get("address") or "")
+    anonymous_id = str(data.get("anonymous_id") or data.get("anonymousId") or "").strip()
+    if email and "+" in email.rsplit("@", 1)[0]:
+        return jsonify({"ok": False, "error": "derived +tag address is local-only; delete the base HME address"}), 400
+    if not _account_mgr.get_account(acc_id):
+        return jsonify({"ok": False, "error": "account not found"}), 404
+    try:
+        client = _account_mgr.get_client(acc_id, verbose=False)
+        aliases = client.list_aliases()
+        target = next((a for a in aliases if anonymous_id and str(a.get("anonymousId") or "") == anonymous_id), None)
+        if not target and email:
+            target = next((a for a in aliases if norm_email(a.get("email")) == email), None)
+        if not target:
+            return jsonify({"ok": False, "error": "HME alias not found for this account"}), 404
+        target_id = str(target.get("anonymousId") or "").strip()
+        target_email = norm_email(target.get("email") or email)
+        if not target_id:
+            return jsonify({"ok": False, "error": "HME alias has no anonymousId"}), 400
+        client.delete(target_id)
+
+        # 删除本机凭证记录，但默认保留邮件，避免远程删除误删历史证据。
+        local_removed = False
+        row = _cf_store.get_address(name=target_email) if target_email else None
+        if row:
+            local_removed = _cf_store.delete_address_record(row["id"], delete_mails=bool(data.get("delete_local_mails", False)))
+        latest_file = RESULTS_DIR / "latest_emails.txt"
+        if target_email and latest_file.exists():
+            lines = latest_file.read_text(encoding="utf-8").splitlines()
+            kept = [line for line in lines if str(line).split("\t", 1)[0].strip().lower() != target_email]
+            latest_file.write_text(("\n".join(kept) + ("\n" if kept else "")), encoding="utf-8")
+        _emit_log("success", f"已删除 Apple HME: {target_email or target_id}")
+        return jsonify({"ok": True, "email": target_email, "anonymous_id": target_id, "local_record_removed": local_removed})
+    except Exception as e:
+        _emit_log("warn", f"删除 Apple HME 失败: {str(e)[:160]}")
+        return jsonify({"ok": False, "error": str(e)[:300]}), 400
 
 @app.route("/api/create-batch", methods=["POST"])
 def api_create_batch():
