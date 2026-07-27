@@ -878,7 +878,7 @@ def _scheduler_loop_random_window():
 def _scheduler_loop_interval():
     cfg = _get_scheduler_config()
     _update_state(running=True, round_status="固定间隔计划已就绪")
-    _emit_log("info", f"调度器已启动 (固定间隔模式: 每 {cfg.get('interval_minutes',60)} 分钟创建 {cfg.get('count_per_run',1)} 个，活跃账号轮询)")
+    _emit_log("info", f"调度器已启动 (固定间隔模式: 每 {cfg.get('interval_minutes',60)} 分钟、每个活跃账号创建 {cfg.get('count_per_run',1)} 个)")
     while not _stop_event.is_set():
         cfg = _get_scheduler_config()
         active_accounts = _get_scheduler_accounts(cfg)
@@ -889,44 +889,60 @@ def _scheduler_loop_interval():
             _stop_event.wait(30)
             continue
         target = _now() + timedelta(minutes=interval_minutes)
-        _update_state(creating=False, round_status=f"计划已设置: 每 {interval_minutes} 分钟创建 {count_per_run} 个", next_trigger=target.timestamp())
-        _emit_log("info", f"固定间隔计划: 下次 {target.strftime('%H:%M:%S')}，每轮 {count_per_run} 个")
+        _update_state(creating=False, round_status=f"计划已设置: 每 {interval_minutes} 分钟/账号创建 {count_per_run} 个", next_trigger=target.timestamp())
+        _emit_log("info", f"固定间隔计划: 下次 {target.strftime('%H:%M:%S')}，{len(active_accounts)} 个活跃账号各创建 {count_per_run} 个")
         if _stop_event.wait(interval_minutes * 60): break
+        # 等待期间账号状态可能变化，执行前重新读取，避免对已失效母号发起请求。
+        active_accounts = _get_scheduler_accounts(cfg)
+        if not active_accounts:
+            _update_state(creating=False, round_status="本周期无活跃账号，等待下个周期")
+            continue
         round_total = 0
         round_failed = False
-        round_error = ""
-        _update_state(creating=True, round_status=f"计划执行中: {count_per_run} 个")
-        for i in range(count_per_run):
+        round_errors = []
+        _update_state(creating=True, round_status=f"计划执行中: {len(active_accounts)} 个账号各 {count_per_run} 个")
+
+        # 固定间隔模式按账号执行，而不是把 count_per_run 当作所有账号合计。
+        # 每个账号的失败/额度限制只结束该账号本轮任务，不能阻断其它母号。
+        for account_index, account in enumerate(active_accounts):
             if _stop_event.is_set(): break
-            active_accounts = _get_scheduler_accounts(cfg)
-            if not active_accounts:
-                _emit_log("warn", "计划执行中断: 无活跃账号")
-                break
-            rr_index = _scheduler_runtime.get("rr_index", 0) % len(active_accounts)
-            account = active_accounts[rr_index]
-            _scheduler_runtime["rr_index"] = (rr_index + 1) % len(active_accounts)
-            acc_id = account["id"]; acc_name = account.get("name", acc_id)
-            result = _create_one_scheduled_alias(acc_id, _make_scheduler_label(account, cfg, i + 1))
-            email = result.get("email", "")
-            if result.get("ok") and email:
-                round_total += 1
-                _increment_state(today_created=1, total_created=1)
-                _emit_log("success", f"[{acc_name}] 计划创建成功: {email}")
-            else:
-                err_str = str(result.get("error", "未知错误"))
-                if _is_limit_error(err_str):
-                    _emit_log("info", f"[{acc_name}] 计划创建触达上限: {err_str[:100]}")
+            acc_id = account["id"]
+            acc_name = account.get("name", acc_id)
+            account_created = 0
+            account_failed = False
+            for alias_index in range(count_per_run):
+                if _stop_event.is_set(): break
+                result = _create_one_scheduled_alias(
+                    acc_id,
+                    _make_scheduler_label(account, cfg, alias_index + 1),
+                )
+                email = result.get("email", "")
+                if result.get("ok") and email:
+                    account_created += 1
+                    round_total += 1
+                    _increment_state(today_created=1, total_created=1)
+                    _emit_log("success", f"[{acc_name}] ({account_created}/{count_per_run}) 计划创建成功: {email}")
                 else:
-                    _emit_log("warn", f"[{acc_name}] 计划创建失败: {err_str[:100]}")
+                    err_str = str(result.get("error", "未知错误"))
+                    account_failed = True
+                    round_errors.append(f"[{acc_name}] {err_str[:240]}")
+                    if _is_limit_error(err_str):
+                        _emit_log("info", f"[{acc_name}] 本轮触达上限，继续处理其它账号: {err_str[:100]}")
+                    else:
+                        _emit_log("warn", f"[{acc_name}] 本轮失败，继续处理其它账号: {err_str[:100]}")
+                    # 该母号本周期失败后等待下一个周期，不连续重试。
+                    break
+                if alias_index < count_per_run - 1 and not _stop_event.is_set():
+                    gap = cfg.get("account_interval_sec", 3.0)
+                    if gap > 0 and _stop_event.wait(gap): break
+            if account_failed:
                 round_failed = True
-                round_error = err_str[:300]
-                _update_state(last_error=round_error, round_status="计划创建失败，等待下个周期")
-                break
-            if i < count_per_run - 1 and not _stop_event.is_set():
+            if account_index < len(active_accounts) - 1 and not _stop_event.is_set():
                 gap = cfg.get("account_interval_sec", 3.0)
                 if gap > 0 and _stop_event.wait(gap): break
         if round_failed:
-            _update_state(creating=False, current_round_created=round_total, last_error=round_error, round_status=f"上次计划失败，已等待下个周期；本轮成功 {round_total} 个")
+            error_summary = "; ".join(round_errors[:3])
+            _update_state(creating=False, current_round_created=round_total, last_error=error_summary[:300], round_status=f"本轮部分失败，已等待下个周期；成功 {round_total} 个")
         else:
             _update_state(creating=False, current_round_created=round_total, round_status=f"上次计划创建 {round_total} 个")
 
@@ -1839,7 +1855,7 @@ UI_HTML = r"""<!DOCTYPE html>
                             <input type="number" id="schedIntervalMin" value="60" min="1" max="1440" style="width:100%">
                         </div>
                         <div style="width:86px">
-                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">每轮数量</div>
+                            <div style="font-size:11px;color:var(--ink-faint);margin-bottom:4px">每账号数量</div>
                             <input type="number" id="schedCount" value="1" min="1" max="20" style="width:100%">
                         </div>
                     </div>
@@ -1853,7 +1869,7 @@ UI_HTML = r"""<!DOCTYPE html>
                             <input type="text" id="schedLabelPrefix" placeholder="可选" style="width:100%">
                         </div>
                     </div>
-                    <div style="font-size:11px;color:var(--ink-faint);margin-top:6px">在所有活跃账号之间轮询；启动后按设定间隔执行。</div>
+                    <div style="font-size:11px;color:var(--ink-faint);margin-top:6px">每个周期遍历所有活跃账号；每个账号独立创建设定数量。某个账号失败不会跳过其它账号。</div>
                 </div>
                 <div id="schedWindowHint" style="font-size:11px;color:var(--ink-faint)">北京时间 7:00-20:00 自动运行，轮次间隔 60-90 分钟，每轮每账号随机创建 3-5 个。</div>
             </div>
@@ -3304,8 +3320,8 @@ UI_HTML = r"""<!DOCTYPE html>
                 '- GET /api/settings：读取全局设置。',
                 '- GET /api/forward-options：读取 Apple 账号允许的转发地址。',
                 '- POST /api/settings：保存 alias_split_enabled、forward_to_email；alias_split_count 固定为 1，传入其它值也会归一为 1。',
-                '- GET /api/scheduler/config：读取计划任务。',
-                '- POST /api/scheduler/config：保存计划任务。',
+                '- GET /api/scheduler/config：读取计划任务；固定间隔模式的 count_per_run 是每个活跃母号的数量。',
+                '- POST /api/scheduler/config：保存计划任务；每个固定间隔周期会遍历所有选中的活跃母号，单个母号失败不会阻断其它母号。',
                 '- POST /api/scheduler/start：启动计划任务。',
                 '- POST /api/scheduler/stop：停止计划任务。',
                 '- GET /api/logs：读取近期运行日志；只摘录决定性错误，禁止回显凭证。',
