@@ -49,7 +49,7 @@ x-admin-auth: $ICLOUD_HME_ADMIN_TOKEN
 
 ## `+tag` family 规则
 
-`xxx+1` 到 `xxx+4` 是本机逻辑派生地址，不一定是 Apple 的独立 HME 地址。Apple 或发件方可能去掉 `+tag`，所以：
+每个真实 HME 只生成一个本机逻辑派生地址 `xxx+1`，它不是 Apple 的独立 HME 地址。历史 `xxx+2` 到 `xxx+4` 邮件仍保留。Apple 或发件方可能去掉 `+tag`，所以：
 
 - API 查询 `xxx+3` 时，必须保留 family 语义，包含 `xxx` 和同 base 的其它派生地址。
 - 不能声称某封只显示 base 的邮件一定原本属于 `+3`；只能标记为 family/ambiguous。

@@ -208,6 +208,24 @@ def test_inbound_family_share_does_not_miss_base_mail():
     print("  PASS test_inbound_family_share_does_not_miss_base_mail")
 
 
+def test_hme_alias_expansion_is_fixed_to_plus_one():
+    """旧配置即使要求 4 个变体，也只能生成唯一的 +1 地址。"""
+    from alias_variants import expand_email_records
+
+    rows = expand_email_records(
+        [{"email": "demo@icloud.com", "account_id": "account-1"}],
+        {"alias_split_enabled": True, "alias_split_count": 4},
+    )
+    assert [row["email"] for row in rows] == [
+        "demo@icloud.com",
+        "demo+1@icloud.com",
+    ]
+    assert rows[1]["base_email"] == "demo@icloud.com"
+    assert rows[1]["variant_index"] == 1
+    assert rows[1]["derived"] is True
+    print("  PASS test_hme_alias_expansion_is_fixed_to_plus_one")
+
+
 def test_icloud_hme_skill_mail_analysis_heuristics():
     """Skill 分析脚本能区分 ChatGPT free/plus/deactivated 信号。"""
     path = HERE / "skills" / "icloud-hme-admin" / "scripts" / "analyze_mail.py"
@@ -238,6 +256,7 @@ if __name__ == "__main__":
         ("cf_credential_normalize_and_id_fallback", test_cf_credential_normalize_and_id_fallback),
         ("inbound_detect_plus_recipient_without_known_alias", test_inbound_detect_plus_recipient_without_known_alias),
         ("inbound_family_share_does_not_miss_base_mail", test_inbound_family_share_does_not_miss_base_mail),
+        ("hme_alias_expansion_is_fixed_to_plus_one", test_hme_alias_expansion_is_fixed_to_plus_one),
         ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     

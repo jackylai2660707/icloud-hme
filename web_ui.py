@@ -14,6 +14,7 @@ from icloud_hme import ICloudHME, extract_chrome_cookies
 from account_manager import AccountManager
 from inbound_mail import InboundMailStore
 from cf_compat import CfCompatStore, normalize_password_secret, normalize_jwt_token, norm_email
+from alias_variants import ALIAS_SPLIT_COUNT, email_plus_variant, expand_email_records
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
@@ -36,7 +37,7 @@ _history_lock = threading.Lock()
 _log_counter = 0
 _counter_lock = threading.Lock()
 _today_key = datetime.now().strftime("%Y%m%d")
-_global_state = {"running":False,"creating":False,"stopping":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0,"scheduler_mode":"window_random","scheduler_interval_minutes":60,"scheduler_count_per_run":1,"scheduler_account_interval_sec":3.0,"scheduler_label_prefix":"","scheduler_selected_accounts":[],"alias_split_enabled":False,"alias_split_count":4,"forward_to_email":""}
+_global_state = {"running":False,"creating":False,"stopping":False,"round_status":"","total_created":0,"today_created":0,"current_round_created":0,"next_trigger":None,"last_error":None,"cookies_ok":False,"alias_count":0,"alias_active":0,"scheduler_mode":"window_random","scheduler_interval_minutes":60,"scheduler_count_per_run":1,"scheduler_account_interval_sec":3.0,"scheduler_label_prefix":"","scheduler_selected_accounts":[],"alias_split_enabled":True,"alias_split_count":ALIAS_SPLIT_COUNT,"forward_to_email":""}
 _lock = threading.Lock()
 _config_lock = threading.Lock()
 _settings_lock = threading.Lock()
@@ -106,8 +107,8 @@ def _increment_state(**kw):
 
 def _default_app_settings() -> dict:
     return {
-        "alias_split_enabled": False,
-        "alias_split_count": 4,
+        "alias_split_enabled": True,
+        "alias_split_count": ALIAS_SPLIT_COUNT,
         "forward_to_email": "",
     }
 
@@ -124,10 +125,8 @@ def _sanitize_app_settings(raw) -> dict:
     if not isinstance(raw, dict):
         return cfg
     cfg["alias_split_enabled"] = bool(raw.get("alias_split_enabled", cfg["alias_split_enabled"]))
-    try:
-        cfg["alias_split_count"] = max(1, min(int(float(raw.get("alias_split_count", cfg["alias_split_count"]))), 20))
-    except Exception:
-        pass
+    # API/config 字段仅为向后兼容；每个真实 HME 固定只派生一个 +1 地址。
+    cfg["alias_split_count"] = ALIAS_SPLIT_COUNT
     cfg["forward_to_email"] = _sanitize_email(raw.get("forward_to_email", cfg["forward_to_email"]))
     return cfg
 
@@ -150,7 +149,7 @@ def _sync_app_state(cfg: dict = None):
     cfg = cfg or _get_app_settings()
     _update_state(
         alias_split_enabled=cfg.get("alias_split_enabled", False),
-        alias_split_count=cfg.get("alias_split_count", 4),
+        alias_split_count=ALIAS_SPLIT_COUNT,
         forward_to_email=cfg.get("forward_to_email", ""),
     )
 
@@ -165,8 +164,7 @@ def _set_app_settings(raw, persist: bool = True) -> dict:
     return cfg
 
 def _email_plus_variant(email: str, index: int) -> str:
-    local, domain = str(email).rsplit("@", 1)
-    return f"{local}+{index}@{domain}"
+    return email_plus_variant(email, index)
 
 def _base_plus_email(email: str) -> str:
     email = norm_email(email)
@@ -177,23 +175,7 @@ def _base_plus_email(email: str) -> str:
 
 def _expand_email_records(records: list, settings: dict = None) -> list:
     settings = settings or _get_app_settings()
-    if not settings.get("alias_split_enabled"):
-        return records
-    count = int(settings.get("alias_split_count", 4) or 4)
-    expanded = []
-    for rec in records:
-        expanded.append(rec)
-        email = rec.get("email", "")
-        if "@" not in email:
-            continue
-        for i in range(1, count + 1):
-            v = dict(rec)
-            v["email"] = _email_plus_variant(email, i)
-            v["base_email"] = email
-            v["variant_index"] = i
-            v["derived"] = True
-            expanded.append(v)
-    return expanded
+    return expand_email_records(records, settings)
 
 def _email_record_key(rec: dict):
     return (
@@ -1901,10 +1883,9 @@ UI_HTML = r"""<!DOCTYPE html>
                     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
                         <label style="font-size:13px;display:flex;gap:6px;align-items:center">
                             <input type="checkbox" id="aliasSplitEnabled">
-                            每个隐私邮箱额外派生
+                            每个隐私邮箱生成唯一派生地址
                         </label>
-                        <input type="number" id="aliasSplitCount" value="4" min="1" max="20" style="width:70px">
-                        <span style="font-size:12px;color:var(--ink-faint)">个变体，例如 <code>name+1@icloud.com</code> ~ <code>name+4@icloud.com</code></span>
+                        <span style="font-size:12px;color:var(--ink-faint)">固定展示 <code>name@icloud.com</code> 和 <code>name+1@icloud.com</code></span>
                     </div>
                     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px">
                         <label style="font-size:13px;font-family:var(--mono)">转发地址:</label>
@@ -2101,7 +2082,7 @@ UI_HTML = r"""<!DOCTYPE html>
     
     <script>
         var E = function(id){ return document.getElementById(id); };
-        var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:false,alias_split_count:4,forward_to_email:''};
+        var state = {running:false,creating:false,stopping:false,round_status:'',total_created:0,today_created:0,current_round_created:0,next_trigger:null,scheduler_mode:'window_random',scheduler_interval_minutes:60,scheduler_count_per_run:1,scheduler_account_interval_sec:3.0,scheduler_label_prefix:'',scheduler_selected_accounts:[],alias_split_enabled:true,alias_split_count:1,forward_to_email:''};
         var accounts = [], emails = [], logs = [], mailAnalysis = null, mailStatusMap = {};
         var forwardOptions = {loaded:false,loading:false,emails:[],selected:'',current:'',accounts:[],error:''};
         var localAliases = [], localMessages = [], localSelectedAlias = '', localSelectedMailId = null, localMsgOffset = 0, localMsgLimit = 30, localMsgTotal = 0, localInboxLoaded = false, localInboxFingerprint = '';
@@ -2184,7 +2165,6 @@ UI_HTML = r"""<!DOCTYPE html>
 
         function applyAppSettingsState(){
             if(E('aliasSplitEnabled')) E('aliasSplitEnabled').checked = !!state.alias_split_enabled;
-            if(E('aliasSplitCount')) E('aliasSplitCount').value = state.alias_split_count || 4;
             renderForwardOptions();
         }
 
@@ -3131,7 +3111,7 @@ UI_HTML = r"""<!DOCTYPE html>
         async function saveAppSettings(){
             var payload = {
                 alias_split_enabled: !!(E('aliasSplitEnabled')&&E('aliasSplitEnabled').checked),
-                alias_split_count: Math.max(1, Math.min(20, parseInt((E('aliasSplitCount')||{}).value||'4',10)||4)),
+                alias_split_count: 1,
                 forward_to_email: ((E('forwardToEmail')||{}).value||'').trim()
             };
             var d = await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -3293,7 +3273,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '【开始工作时必须执行】',
                 '1. GET /api/state：确认服务、调度器、账号和本机收件状态。',
                 '2. GET /api/accounts：获取 iCloud 账号列表及 active/error 状态。',
-                '3. GET /api/emails：获取本地邮箱和派生 +tag 地址列表。',
+                '3. GET /api/emails：获取本地邮箱及每个真实 HME 唯一的 +1 派生地址。',
                 '4. GET /api/local-inbox/summary：获取所有本机收件邮箱与邮件数量。',
                 '只汇报必要的脱敏摘要，不输出 Cookie、Admin Token、INBOUND_TOKEN、Address JWT 或完整邮件原文。',
                 '',
@@ -3301,7 +3281,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '- GET /admin/address?limit=500&offset=0：分页读取凭证地址表。需要与 iCloud/本地记录同步时加 sync=1。',
                 '- GET /admin/address_credential?address=<URL编码邮箱>：为指定邮箱生成 Address JWT 和 login_url。给用户时优先返回 login_url，不使用旧的分享/分配功能。',
                 '- GET /admin/export_credentials.csv：导出全部邮箱凭证。',
-                '- GET /api/aliases：主动从 iCloud 同步真实 HME 别名并生成派生地址；该请求可能较慢。',
+                '- GET /api/aliases：主动从 iCloud 同步真实 HME 别名，并为每个地址生成唯一 +1 派生地址；该请求可能较慢。',
                 '- GET /api/emails：快速读取本地记录和最近缓存。',
                 '',
                 '【收件箱】',
@@ -3309,7 +3289,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '- GET /api/local-inbox/messages?alias=<URL编码邮箱>&limit=50：读取指定邮箱 family 收件箱。',
                 '- GET /api/local-inbox/messages/<mail_id>：读取单封邮件正文。',
                 '- GET /api/mail-analysis：获取高频邮件分类和每个邮箱/family 的 ChatGPT 状态；加 ?refresh=1 强制刷新。',
-                '- +tag 地址使用 family 模式：查询 xxx+3@icloud.com 时也会包含落到 xxx@icloud.com 的邮件，避免 Apple/发送方去掉 +tag 后漏信。',
+                '- 新地址只生成 xxx+1；历史 +2～+4 邮件继续使用 family 模式查询，避免 Apple/发送方去掉 +tag 后漏信。',
                 '- 普通用户可打开 login_url，或使用 Authorization: Bearer <Address JWT> 调用 /api/parsed_mails 和 /api/parsed_mail/<id>。',
                 '',
                 '【创建与账号管理】',
@@ -3323,7 +3303,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '【全局设置与自动化】',
                 '- GET /api/settings：读取全局设置。',
                 '- GET /api/forward-options：读取 Apple 账号允许的转发地址。',
-                '- POST /api/settings：保存 alias_split_enabled、alias_split_count、forward_to_email。',
+                '- POST /api/settings：保存 alias_split_enabled、forward_to_email；alias_split_count 固定为 1，传入其它值也会归一为 1。',
                 '- GET /api/scheduler/config：读取计划任务。',
                 '- POST /api/scheduler/config：保存计划任务。',
                 '- POST /api/scheduler/start：启动计划任务。',

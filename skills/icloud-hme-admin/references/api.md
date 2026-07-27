@@ -89,13 +89,16 @@ Use `/admin/address_credential` and `login_url` instead.
 | Method | Path | Use |
 |---|---|---|
 | GET | `/api/settings` | Read global split/forward settings |
-| POST | `/api/settings` | Change `alias_split_enabled`, `alias_split_count`, `forward_to_email` |
+| POST | `/api/settings` | Change `alias_split_enabled` and `forward_to_email`; `alias_split_count` is compatibility-only and always normalized to `1` |
 | GET | `/api/forward-options` | List Apple-allowed forwarding addresses |
 | GET/POST | `/api/scheduler/config` | Read/save schedule |
 | POST | `/api/scheduler/start` | Start schedule |
 | POST | `/api/scheduler/stop` | Stop schedule |
 
 Do not use `/api/settings` to change forwarding without first reading `/api/forward-options` and confirming the selected address.
+
+Each real HME exposes at most one generated plus variant (`xxx+1`). Historical
+`+2` to `+4` mail is retained and remains readable through base-family queries.
 
 ## Address JWT user API
 
