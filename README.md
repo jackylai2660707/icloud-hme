@@ -46,7 +46,7 @@ python web_ui.py --scheduler        # 启动时自动开启调度器
 | **别名列表** | 实时拉取所有别名，标注所属账号 + 真实邮箱 |
 | **批量创建** | 勾选目标账号 → 输入数量 → 跨账号轮询创建 |
 | **调度器** | 支持两种模式：随机窗口模式；固定间隔模式（如每 30 分钟创建 1 个） |
-| **全局邮箱设置** | 可开启每个隐私邮箱唯一的 `name+1@icloud.com` 派生地址，并设置新建别名尝试使用的转发地址 |
+| **邮箱设置** | 加号派生全局统一；HME 转发地址按 Apple 母号分别设置 |
 
 计划任务说明：
 
@@ -62,7 +62,7 @@ python web_ui.py --scheduler        # 启动时自动开启调度器
 - 例如实际创建 `name@icloud.com`，只展示 `name@icloud.com` 和 `name+1@icloud.com`
 - 这些派生地址不额外调用 Apple 创建接口，不消耗 Hide My Email 创建额度
 - 历史已收取的 `+2` ~ `+4` 邮件不会删除，仍可通过同一 base family 查询
-- 转发地址留空时使用 iCloud 当前默认转发地址；填写时会在新建别名时尝试传给 Apple HME API
+- 转发地址现在按母号单独配置；未配置覆盖值的母号使用该 Apple 账号自己的当前默认转发地址
 
 ### 命令行调度器
 
@@ -130,7 +130,7 @@ python icloud_hme.py delete --email xxx@icloud.com --cookies cookies.json
 accounts.json          # 所有账号及 Cookie（自动持久化）
 scheduler_state.json   # 调度器历史状态
 scheduler_config.json  # Web UI 调度器配置
-app_settings.json      # Web UI 全局邮箱设置（派生开关、转发地址）
+app_settings.json      # Web UI 全局设置（派生开关；转发地址保存在 accounts.json 的各母号记录）
 inbound_config.json    # Cloudflare Email Worker 入站投递 token
 logs/                  # 运行日志
 results/               # 创建的邮箱列表、本机收件箱 SQLite 数据库
@@ -154,8 +154,8 @@ results/               # 创建的邮箱列表、本机收件箱 SQLite 数据�
 
 配置步骤：
 
-1. 在 Apple 账号里添加并验证 `inbox@mail.armsg.yueseng-ys.com` 或你的 catch-all 邮箱。
-2. 回到 Web UI「全局邮箱设置」，刷新并选择该转发地址。
+1. 在每个 Apple 母号里分别添加并验证一个具体转发地址，例如 `hme1@jackylai.eu.org`、`hme2@jackylai.eu.org`。
+2. 回到 Web UI「邮箱设置」，在对应母号行中选择并保存自己的转发地址。
 3. 打开 Web UI「本机收件箱」→「Worker 配置」，复制：
    - `INBOUND_URL`
    - `INBOUND_TOKEN`

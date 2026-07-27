@@ -88,14 +88,18 @@ Use `/admin/address_credential` and `login_url` instead.
 
 | Method | Path | Use |
 |---|---|---|
-| GET | `/api/settings` | Read global split/forward settings |
-| POST | `/api/settings` | Change `alias_split_enabled` and `forward_to_email`; `alias_split_count` is compatibility-only and always normalized to `1` |
-| GET | `/api/forward-options` | List Apple-allowed forwarding addresses |
+| GET | `/api/settings` | Read global split settings; `forward_mode` is `per_account` |
+| POST | `/api/settings` | Change `alias_split_enabled`; non-empty `forward_to_email` is rejected to prevent accidental bulk updates |
+| GET | `/api/forward-options` | Aggregate Apple-allowed forwarding addresses with per-account details |
+| GET | `/api/accounts/{id}/forward-options` | Read one Apple account's allowed/selected forwarding addresses |
+| POST | `/api/accounts/{id}/forward` | Set one account's forwarding address; body `{"forward_to_email":"hme1@jackylai.eu.org"}` or clear local override with `{"clear":true}` |
 | GET/POST | `/api/scheduler/config` | Read/save schedule |
 | POST | `/api/scheduler/start` | Start schedule |
 | POST | `/api/scheduler/stop` | Stop schedule |
 
-Do not use `/api/settings` to change forwarding without first reading `/api/forward-options` and confirming the selected address.
+Forwarding is per Apple account. Only choose an address present in that account's own
+allowed list. A blank local override means the account's current Apple default is used
+when creating new HME aliases. Do not use `/api/settings` to change forwarding.
 
 Each real HME exposes at most one generated plus variant (`xxx+1`). Historical
 `+2` to `+4` mail is retained and remains readable through base-family queries.

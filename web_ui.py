@@ -811,8 +811,7 @@ def _make_scheduler_label(account: dict, cfg: dict, idx: int = 1) -> str:
 
 def _create_one_scheduled_alias(acc_id: str, label: str) -> dict:
     try:
-        forward_to = _get_app_settings().get("forward_to_email", "")
-        results = _account_mgr.create_aliases_for_account(acc_id, count=1, label=label, forward_to=forward_to)
+        results = _account_mgr.create_aliases_for_account(acc_id, count=1, label=label)
         if results:
             return results[0]
         return {"ok": False, "email": None, "account_id": acc_id, "error": "create_alias 返回空结果"}
@@ -1892,8 +1891,8 @@ UI_HTML = r"""<!DOCTYPE html>
             <div class="cards" id="summaryCards"></div>
             <div class="panel" style="margin-top:16px">
                 <div class="panel-header">
-                    <span>全局邮箱设置</span>
-                    <span style="font-size:11px;color:var(--ink-faint)">影响新建记录展示 / 新建别名转发</span>
+                    <span>邮箱设置</span>
+                    <span style="font-size:11px;color:var(--ink-faint)">每个 Apple 母号独立设置转发地址</span>
                 </div>
                 <div class="panel-body" style="padding:14px">
                     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
@@ -1904,12 +1903,11 @@ UI_HTML = r"""<!DOCTYPE html>
                         <span style="font-size:12px;color:var(--ink-faint)">固定展示 <code>name@icloud.com</code> 和 <code>name+1@icloud.com</code></span>
                     </div>
                     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px">
-                        <label style="font-size:13px;font-family:var(--mono)">转发地址:</label>
-                        <select id="forwardToEmail" style="width:360px;max-width:100%">
-                            <option value="">加载 Apple 账号转发地址中...</option>
-                        </select>
-                        <button class="btn btn-outline btn-sm" onclick="refreshForwardOptions(true)">刷新转发地址</button>
-                        <button class="btn btn-primary btn-sm" onclick="saveAppSettings()">保存设置</button>
+                        <button class="btn btn-outline btn-sm" onclick="refreshForwardOptions(true)">刷新母号转发地址</button>
+                        <button class="btn btn-primary btn-sm" onclick="saveAppSettings()">保存派生设置</button>
+                    </div>
+                    <div id="accountForwardSettings" style="display:grid;gap:8px;margin-top:10px">
+                        <div style="font-size:12px;color:var(--ink-faint)">正在读取各 Apple 母号的转发地址...</div>
                     </div>
                     <div id="forwardOptionsHint" style="font-size:11px;color:var(--ink-faint);margin-top:6px">
                         转发地址来自 Apple 账号里已绑定/允许的邮箱；留空则使用 iCloud 当前默认转发地址。
@@ -2190,30 +2188,47 @@ UI_HTML = r"""<!DOCTYPE html>
         }
 
         function renderForwardOptions(){
-            var sel = E('forwardToEmail');
-            if(!sel) return;
-            var emails = forwardOptions.emails || [];
-            var current = state.forward_to_email || forwardOptions.current || '';
-            var preferred = current || forwardOptions.selected || '';
-            var before = sel.value || preferred;
-            var html = ['<option value="">使用 iCloud 当前默认转发地址</option>'];
-            if(preferred && !_emailInList(preferred, emails)){
-                html.push('<option value="'+escAttr(preferred)+'">当前保存: '+esc(preferred)+'（未在 Apple 可选列表中）</option>');
-            }
-            emails.forEach(function(email){
-                var label = email;
-                if(forwardOptions.selected && String(email).toLowerCase()===String(forwardOptions.selected).toLowerCase()){
-                    label += '（Apple 当前默认）';
-                }
-                html.push('<option value="'+escAttr(email)+'">'+esc(label)+'</option>');
-            });
-            sel.innerHTML = html.join('');
-            sel.value = before || preferred || '';
-            if(sel.value && !_emailInList(sel.value, emails) && sel.value !== preferred){
-                sel.value = preferred || '';
-            }
-
+            var box = E('accountForwardSettings');
+            if(!box) return;
             var hint = E('forwardOptionsHint');
+            var details = {};
+            (forwardOptions.accounts || []).forEach(function(item){ details[item.account_id] = item; });
+            if(!accounts.length){
+                box.innerHTML = '<div style="font-size:12px;color:var(--ink-faint)">暂无 Apple 母号，请先导入账号。</div>';
+            } else if(forwardOptions.loading){
+                box.innerHTML = '<div style="font-size:12px;color:var(--ink-faint)">正在读取各 Apple 母号的可选转发地址...</div>';
+            } else {
+                box.innerHTML = accounts.map(function(a){
+                    var d = details[a.id] || {};
+                    var emails = d.emails || [];
+                    var configured = String(a.forward_to_email || d.configured || '').toLowerCase();
+                    var selected = String(d.selected || '').toLowerCase();
+                    var preferred = configured || selected;
+                    var options = ['<option value="">使用该 Apple 母号当前默认地址'+(selected ? '（'+esc(selected)+'）' : '')+'</option>'];
+                    if(preferred && !_emailInList(preferred, emails)){
+                        options.push('<option value="'+escAttr(preferred)+'">当前地址: '+esc(preferred)+'（不在可选列表）</option>');
+                    }
+                    emails.forEach(function(email){
+                        var label = email;
+                        if(String(email).toLowerCase()===selected) label += '（Apple 当前默认）';
+                        if(String(email).toLowerCase()===configured) label += '（项目已配置）';
+                        options.push('<option value="'+escAttr(email)+'">'+esc(label)+'</option>');
+                    });
+                    var error = d.error ? '<div style="font-size:11px;color:var(--red);margin-top:3px">读取失败: '+esc(d.error)+'</div>' : '';
+                    return '<div style="border:1px solid var(--rule);padding:9px 10px;display:grid;grid-template-columns:minmax(180px, .8fr) minmax(260px, 1.5fr) auto;gap:8px;align-items:center">'
+                        +'<div><div style="font-size:12px;font-weight:600">'+esc(a.name||a.real_email||a.id)+'</div><div style="font-size:11px;color:var(--ink-faint);font-family:var(--mono)">'+esc(a.real_email||'')+'</div>'+error+'</div>'
+                        +'<select id="forwardAccount_'+escAttr(a.id)+'" style="width:100%">'+options.join('')+'</select>'
+                        +'<button class="btn btn-outline btn-sm" onclick="saveAccountForward(\''+escAttr(a.id)+'\')">保存</button>'
+                        +'</div>';
+                }).join('');
+                accounts.forEach(function(a){
+                    var d = details[a.id] || {};
+                    var configured = String(a.forward_to_email || d.configured || '').toLowerCase();
+                    var selected = String(d.selected || '').toLowerCase();
+                    var el = E('forwardAccount_'+a.id);
+                    if(el) el.value = configured || selected || '';
+                });
+            }
             if(hint){
                 if(forwardOptions.loading){
                     hint.textContent = '正在从 Apple 账号读取已绑定转发邮箱...';
@@ -2223,15 +2238,24 @@ UI_HTML = r"""<!DOCTYPE html>
                     hint.style.color = 'var(--red)';
                 } else if(forwardOptions.loaded){
                     var okAccounts = (forwardOptions.accounts||[]).filter(function(a){return a.ok;}).length;
-                    hint.textContent = emails.length
-                        ? ('已从 '+okAccounts+' 个账号读取到 '+emails.length+' 个可选转发地址。')
-                        : '未读取到 Apple 可选转发地址；请确认账号 Cookie 有效，或留空使用 iCloud 默认转发地址。';
+                    var failedAccounts = (forwardOptions.accounts||[]).filter(function(a){return !a.ok;}).length;
+                    hint.textContent = '已读取 '+okAccounts+' 个母号；'+(failedAccounts ? failedAccounts+' 个母号读取失败。' : '每个母号可单独选择地址。');
                     hint.style.color = 'var(--ink-faint)';
                 } else {
-                    hint.textContent = '转发地址来自 Apple 账号里已绑定/允许的邮箱；留空则使用 iCloud 当前默认转发地址。';
+                    hint.textContent = '地址来自各 Apple 母号自己的允许列表；保存某一行只会更新对应母号。';
                     hint.style.color = 'var(--ink-faint)';
                 }
             }
+        }
+
+        async function saveAccountForward(accId){
+            var el = E('forwardAccount_'+accId);
+            var value = el ? (el.value||'').trim() : '';
+            var d = await api('/api/accounts/'+encodeURIComponent(accId)+'/forward',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({forward_to_email:value,clear:!value})});
+            if(d.ok) toast(value ? '该母号转发地址已保存' : '已清除该母号的项目覆盖，将使用 Apple 当前默认地址');
+            else toast('保存失败: '+(d.error||'?'),true);
+            forwardOptions.loaded = false;
+            refreshAll();
         }
 
         async function refreshForwardOptions(showToast){
@@ -2250,7 +2274,6 @@ UI_HTML = r"""<!DOCTYPE html>
                     accounts:d.accounts||[],
                     error:''
                 };
-                if(d.current !== undefined) state.forward_to_email = d.current || '';
                 renderForwardOptions();
                 if(showToast) toast('转发地址已刷新');
             } else {
@@ -3127,14 +3150,11 @@ UI_HTML = r"""<!DOCTYPE html>
         async function saveAppSettings(){
             var payload = {
                 alias_split_enabled: !!(E('aliasSplitEnabled')&&E('aliasSplitEnabled').checked),
-                alias_split_count: 1,
-                forward_to_email: ((E('forwardToEmail')||{}).value||'').trim()
+                alias_split_count: 1
             };
             var d = await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
             if(d.ok){
-                if(d.forward_update && d.forward_update.ok) toast('全局设置已保存，Apple 转发地址已同步');
-                else if(d.forward_update && !d.forward_update.ok) toast('全局设置已保存，但 Apple 转发同步失败', true);
-                else toast('全局设置已保存');
+                toast('派生设置已保存');
             }
             else toast('保存失败: '+(d.error||'?'),true);
             refreshAll();
@@ -3318,8 +3338,10 @@ UI_HTML = r"""<!DOCTYPE html>
                 '',
                 '【全局设置与自动化】',
                 '- GET /api/settings：读取全局设置。',
-                '- GET /api/forward-options：读取 Apple 账号允许的转发地址。',
-                '- POST /api/settings：保存 alias_split_enabled、forward_to_email；alias_split_count 固定为 1，传入其它值也会归一为 1。',
+                '- GET /api/forward-options：读取所有母号的转发地址选项和逐账号详情。',
+                '- GET /api/accounts/<account_id>/forward-options：读取指定母号的 Apple 允许地址和当前选择。',
+                '- POST /api/accounts/<account_id>/forward，JSON {"forward_to_email":"hme1@jackylai.eu.org"}：只更新指定母号；清除项目覆盖使用 {"clear":true}。',
+                '- POST /api/settings：只保存全局 alias_split_enabled；转发地址必须按母号设置，禁止使用全局 forward_to_email 批量覆盖。',
                 '- GET /api/scheduler/config：读取计划任务；固定间隔模式的 count_per_run 是每个活跃母号的数量。',
                 '- POST /api/scheduler/config：保存计划任务；每个固定间隔周期会遍历所有选中的活跃母号，单个母号失败不会阻断其它母号。',
                 '- POST /api/scheduler/start：启动计划任务。',
@@ -4078,8 +4100,7 @@ def admin_api_new_address():
     active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
     if not active_accounts:
         return Response("No active iCloud account", status=400)
-    forward_to = _get_app_settings().get("forward_to_email", "")
-    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label, forward_to=forward_to)
+    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label)
     ok = next((r for r in results if r.get("ok") and r.get("email")), None)
     if not ok:
         return Response((results[0].get("error") if results else "create failed"), status=400)
@@ -4095,8 +4116,7 @@ def cf_api_new_address():
     active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
     if not active_accounts:
         return Response("No active iCloud account", status=400)
-    forward_to = _get_app_settings().get("forward_to_email", "")
-    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label, forward_to=forward_to)
+    results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label)
     ok = next((r for r in results if r.get("ok") and r.get("email")), None)
     if not ok:
         return Response((results[0].get("error") if results else "create failed"), status=400)
@@ -4182,24 +4202,20 @@ def api_settings():
     if _has_bearer_token():
         return _json_error(err, 401, detail)
     if request.method == "GET":
-        return jsonify({"ok":True,"settings":_get_app_settings()})
+        settings = _get_app_settings()
+        settings["forward_to_email"] = ""
+        settings["forward_mode"] = "per_account"
+        return jsonify({"ok":True,"settings":settings})
     try:
         payload = request.get_json(silent=True) or {}
+        legacy_forward = str(payload.get("forward_to_email") or "").strip()
+        if legacy_forward:
+            return jsonify({"ok":False,"error":"转发地址已改为按母号独立设置，请使用 /api/accounts/{id}/forward"}), 400
         cfg = _set_app_settings(payload, persist=True)
-        forward_update = None
-        if "forward_to_email" in payload and cfg.get("forward_to_email"):
-            forward_update = _account_mgr.update_forward_to(cfg.get("forward_to_email"))
-            if forward_update.get("ok"):
-                try:
-                    cached_aliases = _sync_cloud_alias_cache()
-                    forward_update["cache_base_count"] = len(cached_aliases)
-                except Exception as cache_err:
-                    forward_update["cache_error"] = str(cache_err)[:200]
-                _emit_log("success", f"Apple HME 转发地址已更新为 {cfg.get('forward_to_email')}")
-            else:
-                _emit_log("warn", f"Apple HME 转发地址更新未完全成功: {forward_update.get('failed_accounts', 0)} 个账号失败")
-        _emit_log("info", f"更新全局邮箱设置: split={cfg.get('alias_split_enabled')} count={cfg.get('alias_split_count')} forward={cfg.get('forward_to_email') or '-'}")
-        return jsonify({"ok":True,"settings":cfg,"forward_update":forward_update})
+        cfg["forward_to_email"] = ""
+        cfg["forward_mode"] = "per_account"
+        _emit_log("info", f"更新全局派生设置: split={cfg.get('alias_split_enabled')} count={cfg.get('alias_split_count')}")
+        return jsonify({"ok":True,"settings":cfg,"forward_mode":"per_account"})
     except ValueError as e:
         return jsonify({"ok":False,"error":str(e)})
     except Exception as e:
@@ -4210,12 +4226,12 @@ def api_forward_options():
     """从 Apple HME 接口读取账号已绑定/允许的转发邮箱，供前端下拉选择。"""
     try:
         options = _account_mgr.get_forward_options()
-        cfg = _get_app_settings()
         return jsonify({
             "ok": True,
             "emails": options.get("emails", []),
             "selected": options.get("selected", ""),
-            "current": cfg.get("forward_to_email", ""),
+            "current": "",
+            "forward_mode": "per_account",
             "accounts": options.get("accounts", []),
         })
     except Exception as e:
@@ -4231,6 +4247,36 @@ def api_accounts():
         ac["has_app_password"] = bool(a.get("app_password"))
         safe.append(ac)
     return jsonify({"accounts":safe,"count":len(safe)})
+
+@app.route("/api/accounts/<acc_id>/forward-options")
+def api_account_forward_options(acc_id):
+    """读取单个 Apple 母号自己的转发地址选项。"""
+    try:
+        return jsonify(_account_mgr.get_account_forward_options(acc_id))
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 502
+
+@app.route("/api/accounts/<acc_id>/forward", methods=["POST"])
+def api_account_forward(acc_id):
+    """只更新一个 Apple 母号的转发地址，不影响其它母号。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        if data.get("clear") or not str(data.get("forward_to_email") or "").strip():
+            result = _account_mgr.clear_account_forward_to(acc_id)
+            _emit_log("info", f"清除母号转发覆盖: {acc_id}")
+            return jsonify(result)
+        result = _account_mgr.set_account_forward_to(acc_id, data.get("forward_to_email"))
+        _emit_log("success", f"更新母号转发地址: {acc_id} -> {result.get('forward_to_email')}")
+        return jsonify(result)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        _emit_log("warn", f"更新母号转发地址失败 [{acc_id}]: {str(e)[:180]}")
+        return jsonify({"ok": False, "error": str(e)[:300]}), 502
 
 @app.route("/api/accounts/add", methods=["POST"])
 def api_add_account():
@@ -4291,8 +4337,7 @@ def api_create_for_account(acc_id):
     acc_name = account.get("name") if account else acc_id
     _emit_log("info",f"[{acc_name}] 手动创建: 账号 {acc_id} x{count}")
     try:
-        forward_to = _get_app_settings().get("forward_to_email", "")
-        results = _account_mgr.create_aliases_for_account(acc_id, count, label, forward_to=forward_to)
+        results = _account_mgr.create_aliases_for_account(acc_id, count, label)
         created = [r["email"] for r in results if r.get("ok")]
         errors = [r["error"] for r in results if not r.get("ok")]
         _update_state(creating=False)
@@ -4358,8 +4403,7 @@ def api_create_batch():
     _update_state(creating=True)
     _emit_log("info",f"批量创建: {len(account_ids)} 个账号 x{count}")
     try:
-        forward_to = _get_app_settings().get("forward_to_email", "")
-        all_results = _account_mgr.create_aliases_batch(account_ids, count, interval, label, forward_to=forward_to)
+        all_results = _account_mgr.create_aliases_batch(account_ids, count, interval, label)
         total_created = sum(sum(1 for r in results if r.get("ok")) for results in all_results.values())
         total_errors = sum(sum(1 for r in results if not r.get("ok")) for results in all_results.values())
         _update_state(creating=False)

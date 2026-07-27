@@ -59,6 +59,15 @@ class AccountManager:
             try:
                 data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
                 self.accounts = data.get("accounts", {})
+                # 旧版本没有按母号保存转发地址；空值表示使用该 Apple
+                # 账号当前自己的默认转发地址，不再回退到全局地址。
+                changed = False
+                for account in self.accounts.values():
+                    if "forward_to_email" not in account:
+                        account["forward_to_email"] = ""
+                        changed = True
+                if changed:
+                    self._save()
             except (json.JSONDecodeError, OSError):
                 self.accounts = {}
 
@@ -148,6 +157,7 @@ class AccountManager:
             "name": name,
             "real_email": "",
             "icloud_email": "",
+            "forward_to_email": "",
             "cookies": cookies,
             "host": host,
             "status": "active",
@@ -247,6 +257,77 @@ class AccountManager:
 
     def get_account(self, acc_id: str) -> Optional[Dict]:
         return self.accounts.get(acc_id)
+
+    def get_account_forward_to(self, acc_id: str) -> str:
+        """返回母号的本地转发覆盖值；空值表示使用 Apple 当前默认值。"""
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        return str(account.get("forward_to_email") or "").strip().lower()
+
+    def set_account_forward_to(self, acc_id: str, forward_to: str) -> Dict[str, Any]:
+        """只更新一个 Apple 母号的 HME 转发地址。"""
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        forward_to = str(forward_to or "").strip().lower()
+        if not forward_to or "@" not in forward_to:
+            raise ValueError("转发地址无效；请先选择 Apple 账号允许的具体地址")
+        if not account.get("cookies"):
+            raise ValueError("账号没有可用 Cookie")
+
+        client = self.get_client(acc_id, verbose=False)
+        options = client.get_forward_options()
+        allowed = {
+            str(email).strip().lower()
+            for email in options.get("emails", [])
+            if str(email).strip() and "@" in str(email)
+        }
+        if allowed and forward_to not in allowed:
+            raise ValueError("该地址不在此 Apple 母号允许的转发地址列表中")
+
+        before = str(options.get("selected") or "").strip().lower()
+        client.update_forward_to(forward_to)
+        after = str(client.get_forward_options().get("selected") or "").strip().lower()
+        if after and after != forward_to:
+            raise RuntimeError("Apple 返回成功，但读取后的转发地址未变化")
+
+        account["forward_to_email"] = forward_to
+        account["last_error"] = None
+        self._save()
+        return {
+            "ok": True,
+            "account_id": acc_id,
+            "forward_to_email": forward_to,
+            "before": before,
+            "after": after or forward_to,
+        }
+
+    def clear_account_forward_to(self, acc_id: str) -> Dict[str, Any]:
+        """清除本地覆盖；Apple 端保持当前默认转发地址不变。"""
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        account["forward_to_email"] = ""
+        self._save()
+        return {"ok": True, "account_id": acc_id, "forward_to_email": ""}
+
+    def get_account_forward_options(self, acc_id: str) -> Dict[str, Any]:
+        """读取单个母号的 Apple 可选转发地址和当前选择。"""
+        account = self.accounts.get(acc_id)
+        if not account:
+            raise KeyError(f"账号不存在: {acc_id}")
+        client = self.get_client(acc_id, verbose=False)
+        data = client.get_forward_options()
+        return {
+            "account_id": acc_id,
+            "account_name": account.get("name", ""),
+            "account_email": account.get("real_email", ""),
+            "emails": data.get("emails", []),
+            "selected": data.get("selected", ""),
+            "configured": self.get_account_forward_to(acc_id),
+            "ok": True,
+        }
 
     def list_accounts(self) -> List[Dict]:
         return sorted(
@@ -379,6 +460,7 @@ class AccountManager:
                 "status": account.get("status", ""),
                 "emails": [],
                 "selected": "",
+                "configured": str(account.get("forward_to_email") or "").strip().lower(),
                 "ok": False,
             }
             try:
@@ -639,6 +721,11 @@ class AccountManager:
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
 
+        # 调用方不传覆盖值时，严格使用该母号自己的配置；不再读取全局转发地址。
+        effective_forward_to = str(
+            forward_to or account.get("forward_to_email") or ""
+        ).strip().lower()
+
         client = ICloudHME(
             account["cookies"],
             host=account.get("host", "icloud.com"),
@@ -652,14 +739,14 @@ class AccountManager:
                     f"{account.get('name', acc_id)} "
                     f"{datetime.now().strftime('%m%d%H%M')}-{i + 1}"
                 )
-                result = client.create_alias(label=alias_label, max_retries=3, forward_to=forward_to or None)
+                result = client.create_alias(label=alias_label, max_retries=3, forward_to=effective_forward_to or None)
                 email = result.get("email", "")
                 if email:
                     results.append({
                         "email": email,
                         "account_id": acc_id,
                         "ok": True,
-                        "forward_to": forward_to or "",
+                        "forward_to": effective_forward_to,
                     })
                     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
                     with open(str(LATEST_EMAILS), "a", encoding="utf-8") as f:

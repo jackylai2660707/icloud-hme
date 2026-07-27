@@ -226,6 +226,25 @@ def test_hme_alias_expansion_is_fixed_to_plus_one():
     print("  PASS test_hme_alias_expansion_is_fixed_to_plus_one")
 
 
+def test_forward_setting_is_scoped_to_one_account():
+    """转发覆盖值按母号保存，清除一个母号不会影响另一个。"""
+    from account_manager import AccountManager
+
+    mgr = AccountManager.__new__(AccountManager)
+    mgr.accounts = {
+        "a": {"id": "a", "forward_to_email": "hme1@jackylai.eu.org"},
+        "b": {"id": "b", "forward_to_email": "hme2@jackylai.eu.org"},
+    }
+    mgr._save = lambda: None
+    assert mgr.get_account_forward_to("a") == "hme1@jackylai.eu.org"
+    assert mgr.get_account_forward_to("b") == "hme2@jackylai.eu.org"
+    result = mgr.clear_account_forward_to("a")
+    assert result["ok"] is True
+    assert mgr.get_account_forward_to("a") == ""
+    assert mgr.get_account_forward_to("b") == "hme2@jackylai.eu.org"
+    print("  PASS test_forward_setting_is_scoped_to_one_account")
+
+
 def test_icloud_hme_skill_mail_analysis_heuristics():
     """Skill 分析脚本能区分 ChatGPT free/plus/deactivated 信号。"""
     path = HERE / "skills" / "icloud-hme-admin" / "scripts" / "analyze_mail.py"
@@ -257,6 +276,7 @@ if __name__ == "__main__":
         ("inbound_detect_plus_recipient_without_known_alias", test_inbound_detect_plus_recipient_without_known_alias),
         ("inbound_family_share_does_not_miss_base_mail", test_inbound_family_share_does_not_miss_base_mail),
         ("hme_alias_expansion_is_fixed_to_plus_one", test_hme_alias_expansion_is_fixed_to_plus_one),
+        ("forward_setting_is_scoped_to_one_account", test_forward_setting_is_scoped_to_one_account),
         ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     
