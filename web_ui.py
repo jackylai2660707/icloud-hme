@@ -15,6 +15,7 @@ from account_manager import AccountManager, HME_ACCOUNT_LIMIT
 from inbound_mail import InboundMailStore
 from cf_compat import CfCompatStore, normalize_password_secret, normalize_jwt_token, norm_email
 from alias_variants import ALIAS_SPLIT_COUNT, email_plus_variant, expand_email_records
+from agent_api import AGENT_API_VERSION, agent_api_catalog, build_agent_openapi
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
@@ -2069,6 +2070,8 @@ UI_HTML = r"""<!DOCTYPE html>
                     <div style="display:flex;gap:8px">
                         <button class="btn btn-outline btn-sm" onclick="renderAgentPrompt()">重新生成</button>
                         <button class="btn btn-primary btn-sm" onclick="copyAgentPrompt()">复制提示词</button>
+                        <a class="btn btn-outline btn-sm" href="/api/agent/bootstrap" target="_blank">查看 Bootstrap</a>
+                        <a class="btn btn-outline btn-sm" href="/api/agent/openapi.json" target="_blank">OpenAPI</a>
                         <a class="btn btn-outline btn-sm" href="/admin/download_skill">下载 Skill</a>
                     </div>
                 </div>
@@ -2084,6 +2087,12 @@ UI_HTML = r"""<!DOCTYPE html>
                         <label style="font-size:12px">Admin API Token
                             <input id="agentAdminToken" type="password" style="display:block;width:100%;margin-top:5px" oninput="renderAgentPrompt()" placeholder="从当前管理员登录自动读取">
                         </label>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:end;margin-bottom:12px">
+                        <label style="font-size:12px;flex:1">Agent Bootstrap API
+                            <input id="agentBootstrapUrl" type="text" readonly style="display:block;width:100%;margin-top:5px;font-family:var(--mono)">
+                        </label>
+                        <button class="btn btn-outline btn-sm" onclick="copyAgentBootstrapUrl()">复制接口地址</button>
                     </div>
                     <label style="font-size:12px;display:flex;align-items:center;gap:8px;margin-bottom:12px">
                         <input id="agentIncludeToken" type="checkbox" checked onchange="renderAgentPrompt()"> 在提示词中包含当前 Admin Token（可直接执行）
@@ -3318,6 +3327,7 @@ UI_HTML = r"""<!DOCTYPE html>
             if(!baseInput.value) baseInput.value = location.origin;
             if(!tokenInput.value) tokenInput.value = localStorage.getItem('icloud_admin_auth') || '';
             var base = (baseInput.value || location.origin).replace(/\/$/,'');
+            if(E('agentBootstrapUrl')) E('agentBootstrapUrl').value = base + '/api/agent/bootstrap';
             var token = includeToken.checked ? (tokenInput.value || '<ADMIN_TOKEN>') : '<ADMIN_TOKEN>';
             var lines = [
                 '你是 iCloud HME Mail 系统的自动化管理 Agent。请通过 HTTP API 操作系统，不要猜测页面状态。',
@@ -3328,6 +3338,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '认证方式：所有管理员接口添加请求头 x-admin-auth: <Admin API Token>。该 Token 等同完整管理员权限，不得在日志、回复或代码仓库中泄露。',
                 '',
                 '【开始工作时必须执行】',
+                '0. GET /api/agent/bootstrap：读取机器可读能力清单、安全规则、实时状态、推荐工作流和 OpenAPI 地址，并以它为当前系统事实来源。',
                 '1. GET /api/state：确认服务、调度器、账号和本机收件状态。',
                 '2. GET /api/accounts：获取 iCloud 账号列表及 active/error 状态。',
                 '3. GET /api/emails：获取本地邮箱及每个真实 HME 唯一的 +1 派生地址。',
@@ -3392,6 +3403,11 @@ UI_HTML = r"""<!DOCTYPE html>
                 E('agentPromptText').select();
                 toast('无法自动复制，已选中全文',true);
             });
+        }
+
+        function copyAgentBootstrapUrl(){
+            var value = (E('agentBootstrapUrl')||{}).value || (location.origin+'/api/agent/bootstrap');
+            navigator.clipboard.writeText(value).then(function(){ toast('Bootstrap 接口地址已复制'); }).catch(function(){ toast('复制失败',true); });
         }
 
         function updateInboxAccountSelect(){
@@ -4195,6 +4211,92 @@ def admin_api_create_user():
 @app.route("/admin/users/<int:user_id>", methods=["DELETE"])
 def admin_api_delete_user(user_id):
     return jsonify({"success": _cf_store.delete_user(user_id)})
+
+def _agent_bootstrap_payload() -> dict:
+    """返回可供管理员 Agent 自发现的无密钥控制面描述。"""
+    base = _share_base_url()
+    summary = _account_mgr.get_summary()
+    inbound_stats = _inbound_store.stats()
+    with _lock:
+        runtime = dict(_global_state)
+    accounts = []
+    for account in _account_mgr.list_accounts():
+        alias_total = max(0, int(account.get("alias_total", 0) or 0))
+        accounts.append({
+            "id": account.get("id"),
+            "name": account.get("name", ""),
+            "account_email": account.get("real_email", ""),
+            "status": account.get("status", ""),
+            "alias_total": alias_total,
+            "alias_active": int(account.get("alias_active", 0) or 0),
+            "hme_limit": HME_ACCOUNT_LIMIT,
+            "hme_full": alias_total >= HME_ACCOUNT_LIMIT,
+            "hme_remaining": max(0, HME_ACCOUNT_LIMIT - alias_total),
+            "forward_to_email": account.get("forward_to_email", ""),
+            "has_cookies": bool(account.get("cookies")),
+        })
+    return {
+        "ok": True,
+        "system": "icloud-hme",
+        "api_version": AGENT_API_VERSION,
+        "base_url": base,
+        "authentication": {
+            "type": "api_key",
+            "header": "x-admin-auth",
+            "value": "<ADMIN_TOKEN>",
+            "warning": "The Admin token grants full control. Never echo, log, persist or commit it.",
+        },
+        "discovery": {
+            "bootstrap_url": f"{base}/api/agent/bootstrap",
+            "openapi_url": f"{base}/api/agent/openapi.json",
+            "skill_download_url": f"{base}/admin/download_skill",
+        },
+        "safety_rules": [
+            "Read /api/agent/bootstrap, /api/state and /api/accounts before any mutation.",
+            "Obtain explicit user confirmation before create, delete, Cookie replacement, credential export, token rotation or scheduler start/stop.",
+            "Never output Apple Cookies, Admin tokens, inbound tokens, Address JWTs, full raw MIME or passwords.",
+            "Change one variable at a time and verify with the corresponding GET endpoint.",
+            "Do not create HME when hme_full=true or hme_remaining=0; the server also enforces the 750 limit.",
+            "Forwarding is per mother account; only select an address returned by that account's forward-options endpoint.",
+            "Treat +tag mail status as family-level evidence because upstream forwarding may remove the tag.",
+        ],
+        "recommended_workflows": {
+            "initial_audit": ["GET /api/state", "GET /api/accounts", "GET /api/emails", "GET /api/local-inbox/summary"],
+            "create_hme": ["GET /api/accounts", "verify hme_remaining > 0", "confirm with user", "POST /api/accounts/{account_id}/create", "GET /api/accounts"],
+            "set_forwarding": ["GET /api/accounts/{account_id}/forward-options", "confirm selected exact address", "POST /api/accounts/{account_id}/forward", "GET /api/accounts/{account_id}/forward-options"],
+            "read_mail": ["GET /api/local-inbox/summary", "GET /api/local-inbox/messages?alias={address}", "GET /api/local-inbox/messages/{mail_id}"],
+            "analyze_openai": ["GET /api/mail-analysis?refresh=1", "use family_status_counts", "preserve unknown and heuristic warnings"],
+            "scheduler": ["GET /api/scheduler/config", "confirm with user", "POST /api/scheduler/start or /stop", "GET /api/state"],
+            "destructive_change": ["identify exact target", "explain impact", "obtain explicit confirmation", "perform one request", "verify immediately"],
+        },
+        "live_state": {
+            "scheduler": {
+                **{k: runtime.get(k) for k in ("running", "creating", "stopping", "round_status", "next_trigger")},
+                "has_last_error": bool(runtime.get("last_error")),
+            },
+            "accounts": summary,
+            "inbox": {
+                "total_mails": inbound_stats.get("total_mails", 0),
+                "mailbox_families": inbound_stats.get("alias_count", 0),
+            },
+            "scheduler_config": _get_scheduler_config(),
+            "mother_accounts": accounts,
+        },
+        "capabilities": agent_api_catalog(),
+        "response_policy": "Return concise sanitized summaries and decisive errors; do not dump secrets or full message bodies unless explicitly requested.",
+    }
+
+@app.route("/api/agent/bootstrap")
+def api_agent_bootstrap():
+    response = jsonify(_agent_bootstrap_payload())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.route("/api/agent/openapi.json")
+def api_agent_openapi():
+    response = jsonify(build_agent_openapi(_share_base_url()))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 @app.route("/api/state")
 def api_state():

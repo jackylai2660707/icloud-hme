@@ -172,6 +172,8 @@ results/               # 创建的邮箱列表、本机收件箱 SQLite 数据�
 
 | 接口 | 说明 |
 |------|------|
+| `GET /api/agent/bootstrap` | Agent 自发现入口：认证、能力清单、安全规则、工作流和实时脱敏状态 |
+| `GET /api/agent/openapi.json` | OpenAPI 3.1 管理接口描述 |
 | `POST /api/inbound-mail` | Cloudflare Worker 投递原始邮件，Bearer token 认证 |
 | `GET /api/local-inbox/summary` | 按隐私邮箱统计本机收到的邮件 |
 | `GET /api/local-inbox/messages?alias=xxx@icloud.com` | 查看某个隐私邮箱 family 收件箱 |

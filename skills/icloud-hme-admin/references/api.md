@@ -14,11 +14,17 @@ x-admin-auth: <Admin API token>
 BASE="${ICLOUD_HME_BASE_URL:?set ICLOUD_HME_BASE_URL}"
 AUTH="${ICLOUD_HME_ADMIN_TOKEN:?set ICLOUD_HME_ADMIN_TOKEN}"
 
+curl -fsS "$BASE/api/agent/bootstrap" -H "x-admin-auth: $AUTH"
 curl -fsS "$BASE/api/state" -H "x-admin-auth: $AUTH"
 curl -fsS "$BASE/api/accounts" -H "x-admin-auth: $AUTH"
 curl -fsS "$BASE/api/emails" -H "x-admin-auth: $AUTH"
 curl -fsS "$BASE/api/local-inbox/summary" -H "x-admin-auth: $AUTH"
 ```
+
+Discovery endpoints:
+
+- `GET /api/agent/bootstrap`: machine-readable catalog, risk levels, confirmation rules, workflows and sanitized live state.
+- `GET /api/agent/openapi.json`: OpenAPI 3.1 document using `x-admin-auth` security.
 
 ## Accounts and HME
 

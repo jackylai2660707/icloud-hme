@@ -268,6 +268,31 @@ def test_full_hme_account_does_not_call_apple_create():
     print("  PASS test_full_hme_account_does_not_call_apple_create")
 
 
+def test_agent_api_catalog_is_safe_and_complete():
+    """Agent 自发现清单应覆盖核心操作并标记高风险动作。"""
+    from agent_api import agent_api_catalog, build_agent_openapi
+
+    catalog = agent_api_catalog()
+    by_id = {item["id"]: item for item in catalog}
+    for required in (
+        "accounts", "hme_create", "hme_delete", "inbox_messages",
+        "mail_analysis", "account_forward_set", "scheduler_start",
+        "account_cookie", "skill_download",
+    ):
+        assert required in by_id
+    assert by_id["hme_delete"]["confirmation_required"] is True
+    assert by_id["account_cookie"]["confirmation_required"] is True
+    spec = build_agent_openapi("https://icloud.example")
+    assert spec["openapi"] == "3.1.0"
+    assert spec["components"]["securitySchemes"]["AdminAuth"]["name"] == "x-admin-auth"
+    create_params = spec["paths"]["/api/accounts/{account_id}/create"]["post"]["parameters"]
+    assert any(p["name"] == "account_id" and p["in"] == "path" and p["required"] for p in create_params)
+    encoded = json.dumps(spec)
+    assert "ADMIN_TOKEN" not in encoded
+    assert "cookie_input\": \"<USER_SUPPLIED_COOKIE>" in encoded
+    print("  PASS test_agent_api_catalog_is_safe_and_complete")
+
+
 def test_icloud_hme_skill_mail_analysis_heuristics():
     """Skill 分析脚本能区分 ChatGPT free/plus/deactivated 信号。"""
     path = HERE / "skills" / "icloud-hme-admin" / "scripts" / "analyze_mail.py"
@@ -306,6 +331,7 @@ if __name__ == "__main__":
         ("hme_alias_expansion_is_fixed_to_plus_one", test_hme_alias_expansion_is_fixed_to_plus_one),
         ("forward_setting_is_scoped_to_one_account", test_forward_setting_is_scoped_to_one_account),
         ("full_hme_account_does_not_call_apple_create", test_full_hme_account_does_not_call_apple_create),
+        ("agent_api_catalog_is_safe_and_complete", test_agent_api_catalog_is_safe_and_complete),
         ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     

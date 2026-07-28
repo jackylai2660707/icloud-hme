@@ -30,11 +30,12 @@ x-admin-auth: $ICLOUD_HME_ADMIN_TOKEN
 
 ## 标准工作流
 
-1. 读取 `/api/state`、`/api/accounts`、`/api/emails`、`/api/local-inbox/summary`，建立当前状态快照。
-2. 根据用户目标选择最窄的 API；不要为了获取邮箱列表调用可能触发 iCloud 同步的慢接口。
-3. 修改前说明影响和目标对象；删除账号、删除 HME、本机清空邮件、更新 Cookie、重置 inbound token、启停计划任务必须得到用户确认。
-4. 每次只改变一个变量，执行后重新读取相关状态验证。
-5. 输出结果时只展示脱敏地址、数量、状态和错误摘要；不回显 Admin Token、Cookie、inbound token、Address JWT、完整 raw MIME 或完整邮件正文。
+1. 首先读取 `/api/agent/bootstrap`，以返回的能力清单、安全规则和实时状态作为当前系统事实来源；需要工具定义时读取 `/api/agent/openapi.json`。
+2. 读取 `/api/state`、`/api/accounts`、`/api/emails`、`/api/local-inbox/summary`，建立当前状态快照。
+3. 根据用户目标选择最窄的 API；不要为了获取邮箱列表调用可能触发 iCloud 同步的慢接口。
+4. 修改前说明影响和目标对象；删除账号、删除 HME、本机清空邮件、更新 Cookie、重置 inbound token、启停计划任务必须得到用户确认。
+5. 每次只改变一个变量，执行后重新读取相关状态验证。
+6. 输出结果时只展示脱敏地址、数量、状态和错误摘要；不回显 Admin Token、Cookie、inbound token、Address JWT、完整 raw MIME 或完整邮件正文。
 
 ## 常用操作
 
