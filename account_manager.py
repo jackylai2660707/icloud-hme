@@ -32,6 +32,7 @@ ACCOUNTS_FILE = HERE / "accounts.json"
 OLD_COOKIES_FILE = HERE / "cookies.json"
 RESULTS_DIR = HERE / "results"
 LATEST_EMAILS = RESULTS_DIR / "latest_emails.txt"
+HME_ACCOUNT_LIMIT = 750
 
 from mail_cache import get_cache  # noqa: E402
 
@@ -720,6 +721,21 @@ class AccountManager:
         account = self.accounts.get(acc_id)
         if not account:
             raise KeyError(f"账号不存在: {acc_id}")
+
+        try:
+            alias_total = max(0, int(account.get("alias_total", 0) or 0))
+        except (TypeError, ValueError):
+            alias_total = 0
+        remaining = max(0, HME_ACCOUNT_LIMIT - alias_total)
+        if remaining <= 0:
+            return [{
+                "email": None,
+                "account_id": acc_id,
+                "ok": False,
+                "limit_reached": True,
+                "error": f"该母号已有 {alias_total} 个 HME，已达到 {HME_ACCOUNT_LIMIT} 上限，未调用 Apple 创建接口",
+            }]
+        count = min(max(1, int(count or 1)), remaining)
 
         # 调用方不传覆盖值时，严格使用该母号自己的配置；不再读取全局转发地址。
         effective_forward_to = str(

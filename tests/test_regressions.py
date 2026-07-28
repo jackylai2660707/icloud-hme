@@ -245,6 +245,29 @@ def test_forward_setting_is_scoped_to_one_account():
     print("  PASS test_forward_setting_is_scoped_to_one_account")
 
 
+def test_full_hme_account_does_not_call_apple_create():
+    """母号达到 750 个 HME 后应在本地短路，不实例化 Apple 客户端。"""
+    from account_manager import AccountManager, HME_ACCOUNT_LIMIT
+
+    mgr = AccountManager.__new__(AccountManager)
+    mgr.accounts = {
+        "full": {
+            "id": "full",
+            "name": "full account",
+            "cookies": {},
+            "alias_total": HME_ACCOUNT_LIMIT,
+            "alias_active": HME_ACCOUNT_LIMIT,
+        }
+    }
+    rows = mgr.create_aliases_for_account("full", count=5)
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False
+    assert rows[0]["limit_reached"] is True
+    assert "未调用 Apple 创建接口" in rows[0]["error"]
+    assert mgr.accounts["full"]["alias_total"] == HME_ACCOUNT_LIMIT
+    print("  PASS test_full_hme_account_does_not_call_apple_create")
+
+
 def test_icloud_hme_skill_mail_analysis_heuristics():
     """Skill 分析脚本能区分 ChatGPT free/plus/deactivated 信号。"""
     path = HERE / "skills" / "icloud-hme-admin" / "scripts" / "analyze_mail.py"
@@ -277,6 +300,7 @@ if __name__ == "__main__":
         ("inbound_family_share_does_not_miss_base_mail", test_inbound_family_share_does_not_miss_base_mail),
         ("hme_alias_expansion_is_fixed_to_plus_one", test_hme_alias_expansion_is_fixed_to_plus_one),
         ("forward_setting_is_scoped_to_one_account", test_forward_setting_is_scoped_to_one_account),
+        ("full_hme_account_does_not_call_apple_create", test_full_hme_account_does_not_call_apple_create),
         ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     

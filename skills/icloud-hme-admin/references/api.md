@@ -97,6 +97,11 @@ Use `/admin/address_credential` and `login_url` instead.
 | POST | `/api/scheduler/start` | Start schedule |
 | POST | `/api/scheduler/stop` | Stop schedule |
 
+`GET /api/accounts` includes `hme_limit`, `hme_full`, and `hme_remaining`.
+When an account reaches 750 HME aliases, every create path short-circuits locally
+without calling Apple. The scheduler skips full accounts and continues with other
+eligible active accounts.
+
 Forwarding is per Apple account. Only choose an address present in that account's own
 allowed list. A blank local override means the account's current Apple default is used
 when creating new HME aliases. Do not use `/api/settings` to change forwarding.

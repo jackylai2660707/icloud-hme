@@ -11,7 +11,7 @@ if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
 
 from flask import Flask, Response, request, jsonify, render_template_string, redirect, make_response, send_file
 from icloud_hme import ICloudHME, extract_chrome_cookies
-from account_manager import AccountManager
+from account_manager import AccountManager, HME_ACCOUNT_LIMIT
 from inbound_mail import InboundMailStore
 from cf_compat import CfCompatStore, normalize_password_secret, normalize_jwt_token, norm_email
 from alias_variants import ALIAS_SPLIT_COUNT, email_plus_variant, expand_email_records
@@ -796,7 +796,11 @@ def _set_scheduler_config(raw, persist: bool = True) -> dict:
 
 def _get_scheduler_accounts(cfg: dict = None):
     cfg = cfg or _get_scheduler_config()
-    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    active_accounts = [
+        a for a in _account_mgr.list_accounts()
+        if a.get("status") == "active"
+        and int(a.get("alias_total", 0) or 0) < HME_ACCOUNT_LIMIT
+    ]
     selected_ids = cfg.get("selected_accounts") or []
     if not selected_ids:
         return active_accounts
@@ -838,7 +842,7 @@ def _scheduler_loop_random_window():
             continue
         active_accounts = _get_scheduler_accounts(cfg)
         if not active_accounts:
-            _update_state(creating=False, round_status="无活跃账号，跳过", next_trigger=None)
+            _update_state(creating=False, round_status=f"无可创建母号（未激活或已达 {HME_ACCOUNT_LIMIT}）", next_trigger=None)
             _stop_event.wait(1800)
             continue
         round_total = 0
@@ -884,7 +888,7 @@ def _scheduler_loop_interval():
         interval_minutes = cfg.get("interval_minutes", 60)
         count_per_run = cfg.get("count_per_run", 1)
         if not active_accounts:
-            _update_state(creating=False, round_status="无活跃账号，等待...", next_trigger=None)
+            _update_state(creating=False, round_status=f"无可创建母号（未激活或已达 {HME_ACCOUNT_LIMIT}），等待...", next_trigger=None)
             _stop_event.wait(30)
             continue
         target = _now() + timedelta(minutes=interval_minutes)
@@ -894,7 +898,7 @@ def _scheduler_loop_interval():
         # 等待期间账号状态可能变化，执行前重新读取，避免对已失效母号发起请求。
         active_accounts = _get_scheduler_accounts(cfg)
         if not active_accounts:
-            _update_state(creating=False, round_status="本周期无活跃账号，等待下个周期")
+            _update_state(creating=False, round_status=f"本周期无可创建母号（已达 {HME_ACCOUNT_LIMIT}），等待下个周期")
             continue
         round_total = 0
         round_failed = False
@@ -2412,10 +2416,14 @@ UI_HTML = r"""<!DOCTYPE html>
                 E('accCards').innerHTML = '<div class="empty"><div class="icon"></div>还没有添加账号<br><span style="font-size:12px">点击右上角 "+ 添加账号" 开始</span></div>';
             } else {
                 E('accCards').innerHTML = accounts.map(function(a){
+                    var hmeLimit = parseInt(a.hme_limit || state.hme_account_limit || 750,10) || 750;
+                    var hmeTotal = parseInt(a.alias_total || 0,10) || 0;
+                    var hmeFull = !!a.hme_full || hmeTotal >= hmeLimit;
                     var stCls = a.status==='active'?'ok':'err';
-                    var stText = a.status==='active'?'正常':(a.last_error||'异常');
+                    var stText = hmeFull ? ('已满 '+hmeLimit) : (a.status==='active'?'正常':(a.last_error||'异常'));
                     var email = a.real_email||'?';
-                    return '<div class="acc-card"><div class="acc-header"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'" title="'+escAttr(stText)+'">'+esc(stText.substring(0,20))+'</span></div><div class="acc-stats"><div class="acc-stat">别名: <span class="n">'+(a.alias_total||0)+'</span></div><div class="acc-stat">活跃: <span class="n" style="color:var(--green)">'+(a.alias_active||0)+'</span></div></div><div class="acc-actions"><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',1)">创建 1 个</button><button class="btn btn-outline btn-xs" onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建 5 个</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">校验</button><button class="btn btn-outline btn-xs" onclick="showUpdateCookieModal(\''+escAttr(a.id)+'\')">更新 Cookie</button><button class="btn btn-danger btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除账号</button></div></div>';
+                    var createDisabled = hmeFull ? ' disabled title="已达到 '+hmeLimit+' 个 HME 上限"' : '';
+                    return '<div class="acc-card"><div class="acc-header"><div><div class="acc-title">'+esc(a.name||'未命名')+'</div><div class="acc-email">'+esc(email)+'</div></div><span class="status-badge '+stCls+'" title="'+escAttr(stText)+'">'+esc(stText.substring(0,20))+'</span></div><div class="acc-stats"><div class="acc-stat">别名: <span class="n">'+hmeTotal+' / '+hmeLimit+'</span></div><div class="acc-stat">剩余: <span class="n">'+Math.max(0,hmeLimit-hmeTotal)+'</span></div><div class="acc-stat">活跃: <span class="n" style="color:var(--green)">'+(a.alias_active||0)+'</span></div></div><div class="acc-actions"><button class="btn btn-outline btn-xs"'+createDisabled+' onclick="createForAccount(\''+escAttr(a.id)+'\',1)">创建 1 个</button><button class="btn btn-outline btn-xs"'+createDisabled+' onclick="createForAccount(\''+escAttr(a.id)+'\',5)">创建 5 个</button><button class="btn btn-outline btn-xs" onclick="validateAccount(\''+escAttr(a.id)+'\')">校验</button><button class="btn btn-outline btn-xs" onclick="showUpdateCookieModal(\''+escAttr(a.id)+'\')">更新 Cookie</button><button class="btn btn-danger btn-xs" onclick="removeAccount(\''+escAttr(a.id)+'\')">删除账号</button></div></div>';
                 }).join('');
             }
         }
@@ -2541,7 +2549,10 @@ UI_HTML = r"""<!DOCTYPE html>
         }
         
         function renderBatchPanel(){
-            var activeAccs = accounts.filter(function(a){return a.status==='active'});
+            var activeAccs = accounts.filter(function(a){
+                var limit = parseInt(a.hme_limit || state.hme_account_limit || 750,10) || 750;
+                return a.status==='active' && !a.hme_full && (parseInt(a.alias_total||0,10)||0) < limit;
+            });
             E('batchAccCount').textContent = activeAccs.length+' 个可用账号';
             var g = E('batchChkGroup');
             if(!activeAccs.length){
@@ -3331,6 +3342,7 @@ UI_HTML = r"""<!DOCTYPE html>
                 '【创建与账号管理】',
                 '- POST /api/accounts/<account_id>/create，JSON {"count":1,"label":"可选"}：指定账号创建 HME。',
                 '- POST /api/create-batch，JSON {"account_ids":["id1"],"count_per_account":1,"label":"可选"}：跨账号批量创建。',
+                '- 每个母号上限为 750 个 HME；GET /api/accounts 返回 hme_full 和 hme_remaining。已满母号禁止手动/批量/计划创建，且不得调用 Apple 生成接口。',
                 '- POST /api/accounts/<account_id>/alias-delete，JSON {"email":"xxx@icloud.com"}：删除真实 Apple HME；不能删除本地 +tag 派生地址。执行前必须确认，并默认保留本机历史邮件。',
                 '- POST /api/accounts/<account_id>/validate：校验 iCloud 会话。',
                 '- POST /api/accounts/<account_id>/cookies，JSON {"name":"账号名","cookie_input":"用户提供的新 Cookie"}：更新 Cookie。只在用户明确提供 Cookie 时使用。',
@@ -4097,7 +4109,7 @@ def admin_api_export_credentials(fmt="json"):
 def admin_api_new_address():
     data = request.get_json(silent=True) or {}
     label = str(data.get("label") or data.get("name") or "admin").strip()
-    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active" and int(a.get("alias_total", 0) or 0) < HME_ACCOUNT_LIMIT]
     if not active_accounts:
         return Response("No active iCloud account", status=400)
     results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label)
@@ -4113,7 +4125,7 @@ def cf_api_new_address():
     # cftempmail 兼容端点。本项目禁用匿名创建；管理员或已登录用户可以调用。
     data = request.get_json(silent=True) or {}
     label = str(data.get("label") or data.get("name") or "api").strip()
-    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active"]
+    active_accounts = [a for a in _account_mgr.list_accounts() if a.get("status") == "active" and int(a.get("alias_total", 0) or 0) < HME_ACCOUNT_LIMIT]
     if not active_accounts:
         return Response("No active iCloud account", status=400)
     results = _account_mgr.create_aliases_for_account(active_accounts[0]["id"], 1, label=label)
@@ -4186,6 +4198,7 @@ def api_state():
         state["local_mail_count"] = inbound_stats.get("total_mails", 0)
         state["local_mail_alias_count"] = inbound_stats.get("alias_count", 0)
         state["local_mail_share_count"] = inbound_stats.get("share_count", 0)
+        state["hme_account_limit"] = HME_ACCOUNT_LIMIT
     return jsonify(state)
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -4245,6 +4258,10 @@ def api_accounts():
         ac = {k:v for k,v in a.items() if k not in ("cookies","app_password")}
         ac["has_cookies"] = bool(a.get("cookies"))
         ac["has_app_password"] = bool(a.get("app_password"))
+        alias_total = max(0, int(a.get("alias_total", 0) or 0))
+        ac["hme_limit"] = HME_ACCOUNT_LIMIT
+        ac["hme_full"] = alias_total >= HME_ACCOUNT_LIMIT
+        ac["hme_remaining"] = max(0, HME_ACCOUNT_LIMIT - alias_total)
         safe.append(ac)
     return jsonify({"accounts":safe,"count":len(safe)})
 
@@ -4375,6 +4392,13 @@ def api_account_alias_delete(acc_id):
         if not target_id:
             return jsonify({"ok": False, "error": "HME alias has no anonymousId"}), 400
         client.delete(target_id)
+
+        account = _account_mgr.get_account(acc_id) or {}
+        _account_mgr.update_account(
+            acc_id,
+            alias_total=max(0, int(account.get("alias_total", 0) or 0) - 1),
+            alias_active=max(0, int(account.get("alias_active", 0) or 0) - (1 if target.get("active", True) else 0)),
+        )
 
         # 删除本机凭证记录，但默认保留邮件，避免远程删除误删历史证据。
         local_removed = False
