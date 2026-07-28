@@ -39,6 +39,8 @@ x-admin-auth: $ICLOUD_HME_ADMIN_TOKEN
 
 ## 常用操作
 
+- **Agent 账号池**：优先使用 `GET /api/agent/account-pool`，它已聚合 HME family、母号、base/+tag 邮箱、邮件数量、OpenAI 状态和每个邮箱的凭证可用性；检查 `analysis_stale` 和 `analysis_cache_age_sec`，只有确需最新状态才加 `refresh_status=1`。需要 CSV 使用 `/api/agent/account-pool.csv`。只有明确需要登录链接且用户确认后，才调用 `POST /api/agent/account-pool/credentials`；传入精确邮箱，`+1` 不会被降级成 base。
+- **Agent 邮件提取**：优先使用 `GET /api/agent/messages`，支持 `mailbox`、`account_id`、`status`、`category`、`query`、`since` 和分页；默认不运行耗时的状态扫描，需要时加 `include_status=1` 或直接使用 `status` 筛选。单封正文使用 `/api/agent/messages/{id}`，默认不返回 raw MIME、headers 或状态分析。
 - **账号**：`GET /api/accounts`；添加 `POST /api/accounts/add`；更新 Cookie `POST /api/accounts/{id}/cookies`；校验 `POST /api/accounts/{id}/validate`；删除配置 `POST /api/accounts/{id}/remove`。
 - **HME**：按账号创建 `POST /api/accounts/{id}/create`；批量创建 `POST /api/create-batch`；获取列表优先 `GET /api/emails`，需要云端同步才使用 `GET /api/aliases`。
 - **凭证**：`GET /admin/address_credential?address=...` 获取 `jwt` 和 `login_url`；全部导出使用 `/admin/export_credentials.csv`。向用户分发时优先使用 `login_url`，不要创建旧版 share token。

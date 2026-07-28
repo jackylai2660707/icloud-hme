@@ -10,6 +10,11 @@ AGENT_API_VERSION = "2026-07-28"
 _ENDPOINTS = [
     {"id": "agent_bootstrap", "method": "GET", "path": "/api/agent/bootstrap", "purpose": "Discover capabilities, workflows, safety rules and live sanitized state", "risk": "read"},
     {"id": "agent_openapi", "method": "GET", "path": "/api/agent/openapi.json", "purpose": "Read the OpenAPI 3.1 description", "risk": "read"},
+    {"id": "agent_account_pool", "method": "GET", "path": "/api/agent/account-pool", "purpose": "Joined HME/OpenAI account pool with mother account, mail counts, status and credential availability", "risk": "read", "query": ["status", "account_id", "query", "has_mail", "sort", "order", "limit", "offset", "refresh_status", "sync"]},
+    {"id": "agent_account_pool_csv", "method": "GET", "path": "/api/agent/account-pool.csv", "purpose": "Export the filtered HME/OpenAI account pool without credentials", "risk": "sensitive_read", "query": ["status", "account_id", "query", "has_mail", "sort", "order", "refresh_status", "sync"]},
+    {"id": "agent_account_pool_credentials", "method": "POST", "path": "/api/agent/account-pool/credentials", "purpose": "Generate login URLs for exact known mailbox addresses, preserving +tag identities", "risk": "secret_response", "confirmation_required": True, "body": {"addresses": ["base@icloud.com", "base+1@icloud.com"], "include_jwt": False}},
+    {"id": "agent_messages", "method": "GET", "path": "/api/agent/messages", "purpose": "Search normalized mail metadata by mailbox, status, category, account or text", "risk": "sensitive_read", "query": ["mailbox", "account_id", "status", "category", "query", "since", "limit", "offset", "include_status", "refresh_status"]},
+    {"id": "agent_message", "method": "GET", "path": "/api/agent/messages/{mail_id}", "purpose": "Read one parsed mail; raw MIME, headers and account-status analysis are opt-in", "risk": "sensitive_read", "query": ["include_raw", "include_headers", "include_status", "refresh_status"]},
     {"id": "state", "method": "GET", "path": "/api/state", "purpose": "Read service, scheduler, HME-limit and inbox state", "risk": "read"},
     {"id": "accounts", "method": "GET", "path": "/api/accounts", "purpose": "List sanitized Apple mother-account records", "risk": "read"},
     {"id": "account_add", "method": "POST", "path": "/api/accounts/add", "purpose": "Import an Apple account from a user-supplied Cookie", "risk": "high", "confirmation_required": True, "body": {"name": "account label", "cookie_input": "<USER_SUPPLIED_COOKIE>"}},
@@ -51,6 +56,46 @@ _ENDPOINTS = [
 
 def agent_api_catalog():
     return deepcopy(_ENDPOINTS)
+
+
+def parse_agent_bool(value, default: bool = False) -> bool:
+    """Parse JSON/query booleans without treating the string ``false`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def parse_agent_pagination(raw_limit, raw_offset, default_limit: int, max_limit: int) -> tuple[int, int]:
+    """Validate Agent API pagination without depending on a web framework."""
+    try:
+        limit = default_limit if raw_limit in (None, "") else int(raw_limit)
+        offset = 0 if raw_offset in (None, "") else int(raw_offset)
+    except (TypeError, ValueError):
+        raise ValueError("limit and offset must be integers")
+    if limit < 1 or limit > max_limit:
+        raise ValueError(f"limit must be between 1 and {max_limit}")
+    if offset < 0:
+        raise ValueError("offset must be greater than or equal to 0")
+    return limit, offset
+
+
+def account_pool_mailbox_index(rows: list) -> dict:
+    """Index every exact mailbox, preserving +tag addresses as distinct logins."""
+    return {
+        str(address).strip().lower(): row
+        for row in rows or []
+        for address in row.get("mailboxes") or []
+        if str(address).strip()
+    }
 
 
 def build_agent_openapi(base_url: str) -> dict:

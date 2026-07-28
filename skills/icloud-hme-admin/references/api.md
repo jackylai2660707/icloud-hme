@@ -26,6 +26,29 @@ Discovery endpoints:
 - `GET /api/agent/bootstrap`: machine-readable catalog, risk levels, confirmation rules, workflows and sanitized live state.
 - `GET /api/agent/openapi.json`: OpenAPI 3.1 document using `x-admin-auth` security.
 
+## Agent aggregation API
+
+- `GET /api/agent/account-pool`: joined HME family, mother account, mail count,
+  latest mail time, OpenAI status/confidence/evidence, and per-mailbox credential
+  availability. Each row contains `mailbox_credentials`; legacy credentialed +tags
+  remain visible, while new derivation is limited to base/+1.
+  Filters: `status`, `account_id`, `query`, `has_mail`, `sort`, `order`, `limit`,
+  `offset`, `refresh_status`; pagination returns `has_more` and `next_offset`. Use
+  `sync=1` only when a fresh Apple cloud sync is required. Inspect `analysis_at`,
+  `analysis_cache_age_sec`, and `analysis_stale`; use `refresh_status=1` when a
+  current status scan is required. Status snapshots are cached for up to 5 minutes
+  so continuous inbound traffic does not block mail extraction.
+- `GET /api/agent/account-pool.csv`: export the same filtered pool without JWTs.
+- `POST /api/agent/account-pool/credentials`: generate sensitive login URLs for an
+  explicit exact `addresses` list (maximum 100); requires confirmation. A requested
+  `base+1@icloud.com` remains `base+1@icloud.com` and is not normalized to base.
+- `GET /api/agent/messages`: normalized mail metadata with `mailbox`, `account_id`,
+  `status`, `category`, `query`, `since`, `limit`, and `offset` filters.
+  Normal extraction does not run the expensive account-status scan; add
+  `include_status=1`, a `status` filter, or `refresh_status=1` only when needed.
+- `GET /api/agent/messages/{mail_id}`: parsed body without raw MIME/headers by default;
+  use `include_raw=1`, `include_headers=1`, or `include_status=1` only when necessary.
+
 ## Accounts and HME
 
 | Method | Path | Use |

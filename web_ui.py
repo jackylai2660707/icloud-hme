@@ -15,7 +15,14 @@ from account_manager import AccountManager, HME_ACCOUNT_LIMIT
 from inbound_mail import InboundMailStore
 from cf_compat import CfCompatStore, normalize_password_secret, normalize_jwt_token, norm_email
 from alias_variants import ALIAS_SPLIT_COUNT, email_plus_variant, expand_email_records
-from agent_api import AGENT_API_VERSION, agent_api_catalog, build_agent_openapi
+from agent_api import (
+    AGENT_API_VERSION,
+    account_pool_mailbox_index,
+    agent_api_catalog,
+    build_agent_openapi,
+    parse_agent_bool,
+    parse_agent_pagination,
+)
 
 # ---- config ----
 RESULTS_DIR = HERE / "results"
@@ -51,7 +58,7 @@ _scheduler_config = {}
 _scheduler_runtime = {"rr_index":0}
 _app_settings = {}
 _inbound_config = {}
-_mail_analysis_cache = {"at": 0.0, "data": None}
+_mail_analysis_cache = {"at": 0.0, "data": None, "generation": 0, "dirty": False}
 _mail_analysis_cache_lock = threading.Lock()
 ADMIN_COOKIE_NAME = "icloud_admin_auth"
 
@@ -538,6 +545,12 @@ def _analysis_select_evidence(items: list):
     strong = [item for item in items if item.get("status") in ("plus", "deactivated")]
     return strong[0] if strong else (items[0] if items else None)
 
+def _invalidate_mail_analysis_cache():
+    """Mark status analysis stale without slowing down high-volume mail delivery."""
+    with _mail_analysis_cache_lock:
+        _mail_analysis_cache["generation"] = int(_mail_analysis_cache.get("generation") or 0) + 1
+        _mail_analysis_cache["dirty"] = True
+
 def _build_mail_analysis(force: bool = False) -> dict:
     now = time.time()
     with _mail_analysis_cache_lock:
@@ -546,104 +559,117 @@ def _build_mail_analysis(force: bool = False) -> dict:
             result = dict(cached)
             result["cached"] = True
             result["cache_age_sec"] = int(now - float(_mail_analysis_cache.get("at") or now))
+            result["stale"] = bool(_mail_analysis_cache.get("dirty"))
             return result
+        generation = int(_mail_analysis_cache.get("generation") or 0)
 
-        with _inbound_store._lock, _inbound_store._connect() as conn:
-            rows = [dict(row) for row in conn.execute(
-                "SELECT id, hme_alias, base_alias, subject, source_from, created_at, text, html FROM inbound_mails ORDER BY id DESC"
-            ).fetchall()]
+    # The analysis scans message bodies and can take several seconds on a large
+    # inbox. Do not hold the cache lock: inbound delivery must remain immediate.
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id, hme_alias, base_alias, subject, source_from, created_at, text, html FROM inbound_mails ORDER BY id DESC"
+        ).fetchall()]
 
-        known_addresses = set()
-        for record in _known_alias_records_for_inbound():
-            email = norm_email(record.get("email"))
-            if email:
-                known_addresses.add(email)
+    known_addresses = set()
+    for record in _known_alias_records_for_inbound():
+        email = norm_email(record.get("email"))
+        if email:
+            known_addresses.add(email)
 
-        categories = {}
-        evidence = {}
-        chat_candidates = 0
-        for row in rows:
-            alias = norm_email(row.get("hme_alias"))
-            family = norm_email(row.get("base_alias") or _base_plus_email(alias))
-            if alias:
-                known_addresses.add(alias)
-            subject = str(row.get("subject") or "(no subject)")
-            sender = str(row.get("source_from") or "")
-            norm_subject = _analysis_normalize_subject(subject)
-            domain = _analysis_sender_domain(sender)
-            text = " ".join([subject, sender, str(row.get("text") or ""), _analysis_strip_html(row.get("html") or "")])
-            lower = text.lower()
-            if _ANALYSIS_CHATGPT_RE.search(text):
-                chat_candidates += 1
-                status, confidence = _analysis_status(text)
-                if status:
-                    evidence.setdefault(family, []).append({
-                        "status": status, "confidence": confidence, "id": int(row["id"]),
-                        "created_at": row.get("created_at") or "", "alias": alias,
-                    })
-            if _ANALYSIS_CHATGPT_RE.search(lower):
-                category = "ChatGPT/OpenAI"
-            elif re.search(r"(?i)code|验证码|verification|login|登录|otp", lower):
-                category = "登录/验证码"
-            elif re.search(r"(?i)subscription|billing|invoice|receipt|订阅|账单|付款|支付", lower):
-                category = "订阅/账单"
-            elif re.search(r"(?i)security|alert|password|安全|密码|警告", lower):
-                category = "安全通知"
-            elif re.search(r"(?i)invite|invitation|邀请", lower):
-                category = "邀请/协作"
-            else:
-                category = "其它"
-            key = f"{domain}|{norm_subject}"
-            item = categories.setdefault(key, {
-                "category": category, "subject": norm_subject, "sender_domain": domain,
-                "count": 0, "sample_ids": [],
-            })
-            item["count"] += 1
-            if len(item["sample_ids"]) < 5:
-                item["sample_ids"].append(int(row["id"]))
-
-        families = {}
-        for address in known_addresses:
-            families.setdefault(_base_plus_email(address), set()).add(address)
-        for family, items in evidence.items():
-            families.setdefault(family, set()).update(item["alias"] for item in items if item.get("alias"))
-
-        mailbox_status = []
-        family_status_counts = {}
-        for family, aliases in sorted(families.items()):
-            items = sorted(evidence.get(family, []), key=lambda x: (x.get("created_at") or "", x.get("id", 0)), reverse=True)
-            latest = _analysis_select_evidence(items)
-            family_status = latest["status"] if latest else "unknown"
-            family_status_counts[family_status] = family_status_counts.get(family_status, 0) + 1
-            for mailbox in sorted(aliases):
-                mailbox_status.append({
-                    "mailbox": mailbox, "family": family, "status_scope": "family",
-                    "status": family_status,
-                    "confidence": latest["confidence"] if latest else "low",
-                    "evidence_ids": [item["id"] for item in items[:10]],
-                    "latest_evidence_at": latest.get("created_at", "") if latest else "",
-                    "note": "+tag 可能被上游去掉，状态按 family 统计" if any("+" in a.rsplit("@", 1)[0] for a in aliases) else "",
+    categories = {}
+    evidence = {}
+    chat_candidates = 0
+    for row in rows:
+        alias = norm_email(row.get("hme_alias"))
+        family = norm_email(row.get("base_alias") or _base_plus_email(alias))
+        if alias:
+            known_addresses.add(alias)
+        subject = str(row.get("subject") or "(no subject)")
+        sender = str(row.get("source_from") or "")
+        norm_subject = _analysis_normalize_subject(subject)
+        domain = _analysis_sender_domain(sender)
+        text = " ".join([subject, sender, str(row.get("text") or ""), _analysis_strip_html(row.get("html") or "")])
+        lower = text.lower()
+        if _ANALYSIS_CHATGPT_RE.search(text):
+            chat_candidates += 1
+            status, confidence = _analysis_status(text)
+            if status:
+                evidence.setdefault(family, []).append({
+                    "status": status, "confidence": confidence, "id": int(row["id"]),
+                    "created_at": row.get("created_at") or "", "alias": alias,
                 })
+        if _ANALYSIS_CHATGPT_RE.search(lower):
+            category = "ChatGPT/OpenAI"
+        elif re.search(r"(?i)code|验证码|verification|login|登录|otp", lower):
+            category = "登录/验证码"
+        elif re.search(r"(?i)subscription|billing|invoice|receipt|订阅|账单|付款|支付", lower):
+            category = "订阅/账单"
+        elif re.search(r"(?i)security|alert|password|安全|密码|警告", lower):
+            category = "安全通知"
+        elif re.search(r"(?i)invite|invitation|邀请", lower):
+            category = "邀请/协作"
+        else:
+            category = "其它"
+        key = f"{domain}|{norm_subject}"
+        item = categories.setdefault(key, {
+            "category": category, "subject": norm_subject, "sender_domain": domain,
+            "count": 0, "sample_ids": [],
+        })
+        item["count"] += 1
+        if len(item["sample_ids"]) < 5:
+            item["sample_ids"].append(int(row["id"]))
 
-        category_rows = sorted(categories.values(), key=lambda x: (-x["count"], x["subject"]))[:200]
-        status_counts = {}
-        for item in mailbox_status:
-            status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
-        result = {
-            "ok": True, "analysis_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            "messages_total": len(rows), "chatgpt_candidate_messages": chat_candidates,
-            "categories": category_rows, "mailbox_status": mailbox_status,
-            "status_counts": status_counts,
-            "families_total": len(families), "family_status_counts": family_status_counts,
-            "cached": False, "cache_age_sec": 0,
-            "warnings": [
-                "状态来自邮件内容启发式分析，不是 ChatGPT 官方订阅接口。",
-                "+tag 地址按 family 统计；上游去掉 +tag 时无法恢复精确归属。",
-            ],
-        }
+    families = {}
+    for address in known_addresses:
+        families.setdefault(_base_plus_email(address), set()).add(address)
+    for family, items in evidence.items():
+        families.setdefault(family, set()).update(item["alias"] for item in items if item.get("alias"))
+
+    mailbox_status = []
+    family_status_counts = {}
+    for family, aliases in sorted(families.items()):
+        items = sorted(evidence.get(family, []), key=lambda x: (x.get("created_at") or "", x.get("id", 0)), reverse=True)
+        latest = _analysis_select_evidence(items)
+        family_status = latest["status"] if latest else "unknown"
+        family_status_counts[family_status] = family_status_counts.get(family_status, 0) + 1
+        for mailbox in sorted(aliases):
+            mailbox_status.append({
+                "mailbox": mailbox, "family": family, "status_scope": "family",
+                "status": family_status,
+                "confidence": latest["confidence"] if latest else "low",
+                "evidence_ids": [item["id"] for item in items[:10]],
+                "latest_evidence_at": latest.get("created_at", "") if latest else "",
+                "note": "+tag 可能被上游去掉，状态按 family 统计" if any("+" in a.rsplit("@", 1)[0] for a in aliases) else "",
+            })
+
+    category_rows = sorted(categories.values(), key=lambda x: (-x["count"], x["subject"]))[:200]
+    status_counts = {}
+    for item in mailbox_status:
+        status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+    result = {
+        "ok": True, "analysis_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "messages_total": len(rows), "chatgpt_candidate_messages": chat_candidates,
+        "categories": category_rows, "mailbox_status": mailbox_status,
+        "status_counts": status_counts,
+        "families_total": len(families), "family_status_counts": family_status_counts,
+        "cached": False, "cache_age_sec": 0, "stale": False,
+        "warnings": [
+            "状态来自邮件内容启发式分析，不是 ChatGPT 官方订阅接口。",
+            "+tag 地址按 family 统计；上游去掉 +tag 时无法恢复精确归属。",
+        ],
+    }
+    with _mail_analysis_cache_lock:
+        invalidated_during_analysis = int(_mail_analysis_cache.get("generation") or 0) != generation
+        if invalidated_during_analysis:
+            result["cache_invalidated_during_analysis"] = True
+            result["stale"] = True
+        # Cache the consistent DB snapshot even if delivery occurred during the
+        # scan. It is explicitly marked stale and refresh_status=1 remains
+        # available; this avoids a permanent cold-cache loop under live traffic.
         _mail_analysis_cache["at"] = now
         _mail_analysis_cache["data"] = result
-        return result
+        _mail_analysis_cache["dirty"] = invalidated_during_analysis
+    return result
 
 def _list_all_cf_mails(
     limit: int = 50,
@@ -3345,6 +3371,13 @@ UI_HTML = r"""<!DOCTYPE html>
                 '4. GET /api/local-inbox/summary：获取所有本机收件邮箱与邮件数量。',
                 '只汇报必要的脱敏摘要，不输出 Cookie、Admin Token、INBOUND_TOKEN、Address JWT 或完整邮件原文。',
                 '',
+                '【Agent 聚合接口（优先使用）】',
+                '- GET /api/agent/account-pool：一次获取 HME family、所属母号、base/+tag 邮箱、邮件数量、OpenAI 状态和每个邮箱的凭证可用性；支持 status、account_id、query、has_mail、sort、limit、offset。检查 analysis_stale/analysis_cache_age_sec，确需最新状态才加 refresh_status=1。',
+                '- GET /api/agent/account-pool.csv：按相同筛选条件导出无凭证账号池。',
+                '- POST /api/agent/account-pool/credentials，JSON {"addresses":["base@icloud.com","base+1@icloud.com"],"include_jwt":false}：按精确地址生成登录链接（+1 不降级为 base），属于敏感操作，必须先确认。',
+                '- GET /api/agent/messages：按 mailbox、account_id、status、category、query、since 分页提取邮件元数据；默认走快速路径，需要状态时加 include_status=1 或 status 筛选。',
+                '- GET /api/agent/messages/<mail_id>：读取解析后的正文；只有确有必要才加 include_raw=1、include_headers=1 或 include_status=1。',
+                '',
                 '【邮箱与登录链接】',
                 '- GET /admin/address?limit=500&offset=0：分页读取凭证地址表。需要与 iCloud/本地记录同步时加 sync=1。',
                 '- GET /admin/address_credential?address=<URL编码邮箱>：为指定邮箱生成 Address JWT 和 login_url。给用户时优先返回 login_url，不使用旧的分享/分配功能。',
@@ -3999,6 +4032,8 @@ def user_api_delete_mail(mail_id):
         return jsonify({"success": False})
     with _inbound_store._lock, _inbound_store._connect() as conn:
         cur = conn.execute("DELETE FROM inbound_mails WHERE id=?", (int(mail_id),))
+    if cur.rowcount > 0:
+        _invalidate_mail_analysis_cache()
     return jsonify({"success": cur.rowcount > 0})
 
 @app.route("/api/mails")
@@ -4063,6 +4098,8 @@ def cf_api_clear_inbox():
         return Response("InvalidAddressCredentialMsg", status=401)
     with _inbound_store._lock, _inbound_store._connect() as conn:
         cur = conn.execute("DELETE FROM inbound_mails WHERE hme_alias=?", (payload["address"],))
+    if cur.rowcount > 0:
+        _invalidate_mail_analysis_cache()
     return jsonify({"success": cur.rowcount >= 0})
 
 @app.route("/api/clear_sent_items", methods=["DELETE"])
@@ -4176,6 +4213,8 @@ def admin_api_clear_inbox(address_id):
         return jsonify({"success": False})
     with _inbound_store._lock, _inbound_store._connect() as conn:
         cur = conn.execute("DELETE FROM inbound_mails WHERE hme_alias=?", (row["name"],))
+    if cur.rowcount > 0:
+        _invalidate_mail_analysis_cache()
     return jsonify({"success": cur.rowcount >= 0})
 
 @app.route("/admin/mails")
@@ -4189,6 +4228,8 @@ def admin_api_mails():
 def admin_api_delete_mail(mail_id):
     with _inbound_store._lock, _inbound_store._connect() as conn:
         cur = conn.execute("DELETE FROM inbound_mails WHERE id=?", (int(mail_id),))
+    if cur.rowcount > 0:
+        _invalidate_mail_analysis_cache()
     return jsonify({"success": cur.rowcount > 0})
 
 @app.route("/admin/users")
@@ -4261,10 +4302,11 @@ def _agent_bootstrap_payload() -> dict:
             "Treat +tag mail status as family-level evidence because upstream forwarding may remove the tag.",
         ],
         "recommended_workflows": {
-            "initial_audit": ["GET /api/state", "GET /api/accounts", "GET /api/emails", "GET /api/local-inbox/summary"],
+            "initial_audit": ["GET /api/state", "GET /api/accounts", "GET /api/agent/account-pool?limit=100", "GET /api/local-inbox/summary"],
+            "extract_account_pool": ["GET /api/agent/account-pool?status=plus,deactivated&limit=500", "GET /api/agent/account-pool.csv with the same filters", "only after confirmation: POST /api/agent/account-pool/credentials for explicit addresses"],
             "create_hme": ["GET /api/accounts", "verify hme_remaining > 0", "confirm with user", "POST /api/accounts/{account_id}/create", "GET /api/accounts"],
             "set_forwarding": ["GET /api/accounts/{account_id}/forward-options", "confirm selected exact address", "POST /api/accounts/{account_id}/forward", "GET /api/accounts/{account_id}/forward-options"],
-            "read_mail": ["GET /api/local-inbox/summary", "GET /api/local-inbox/messages?alias={address}", "GET /api/local-inbox/messages/{mail_id}"],
+            "read_mail": ["GET /api/agent/messages with mailbox/category filters (fast path)", "use status/include_status only when account status is needed", "GET /api/agent/messages/{mail_id}", "request include_raw=1 only when raw MIME is necessary"],
             "analyze_openai": ["GET /api/mail-analysis?refresh=1", "use family_status_counts", "preserve unknown and heuristic warnings"],
             "scheduler": ["GET /api/scheduler/config", "confirm with user", "POST /api/scheduler/start or /stop", "GET /api/state"],
             "destructive_change": ["identify exact target", "explain impact", "obtain explicit confirmation", "perform one request", "verify immediately"],
@@ -4286,6 +4328,217 @@ def _agent_bootstrap_payload() -> dict:
         "response_policy": "Return concise sanitized summaries and decisive errors; do not dump secrets or full message bodies unless explicitly requested.",
     }
 
+def _agent_status_maps(force: bool = False):
+    analysis = _build_mail_analysis(force=force)
+    family_map = {}
+    for item in analysis.get("mailbox_status", []):
+        family = norm_email(item.get("family") or _base_plus_email(item.get("mailbox")))
+        if family and family not in family_map:
+            family_map[family] = item
+    return analysis, family_map
+
+def _agent_bool(value, default: bool = False) -> bool:
+    return parse_agent_bool(value, default=default)
+
+def _agent_pagination(default_limit: int, max_limit: int) -> tuple[int, int]:
+    """Return validated limit/offset values and produce a useful 400 on bad input."""
+    return parse_agent_pagination(
+        request.args.get("limit"),
+        request.args.get("offset"),
+        default_limit=default_limit,
+        max_limit=max_limit,
+    )
+
+def _agent_account_pool_rows(force_status: bool = False) -> tuple[list, dict]:
+    """聚合 HME、母号、邮件计数、OpenAI 状态和凭证可用性。"""
+    analysis, status_map = _agent_status_maps(force=force_status)
+    families = {}
+    account_names = {a.get("id"): a.get("name") or a.get("real_email") or a.get("id") for a in _account_mgr.list_accounts()}
+    for record in _known_alias_records_for_inbound():
+        email = norm_email(record.get("email"))
+        family = _base_plus_email(email)
+        if not family:
+            continue
+        row = families.setdefault(family, {
+            "family": family,
+            "primary_email": family,
+            "mailboxes": set(),
+            "account_id": "",
+            "account_name": "",
+            "label": "",
+            "source": "",
+        })
+        row["mailboxes"].add(email)
+        if record.get("account_id"):
+            row["account_id"] = str(record.get("account_id"))
+            row["account_name"] = account_names.get(row["account_id"], row["account_id"])
+        row["label"] = row["label"] or str(record.get("label") or "")
+        row["source"] = row["source"] or str(record.get("source") or "")
+
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        mail_stats = {
+            norm_email(r["family"]): dict(r)
+            for r in conn.execute(
+                """SELECT COALESCE(NULLIF(base_alias,''), hme_alias) AS family,
+                          COUNT(*) AS mail_count, MAX(created_at) AS latest_mail_at
+                   FROM inbound_mails GROUP BY COALESCE(NULLIF(base_alias,''), hme_alias)"""
+            ).fetchall()
+        }
+        credential_rows = {
+            norm_email(r["name"]): dict(r)
+            for r in conn.execute("SELECT id,name,account_id,label FROM cf_addresses").fetchall()
+        }
+
+    # Keep legacy +2/+3/+4 credential addresses visible for existing users, while
+    # newly derived addresses remain restricted by alias_variants.py to base/+1.
+    # A credential row is accepted only when its base belongs to a known HME family.
+    for address in credential_rows:
+        family = _base_plus_email(address)
+        if family in families:
+            families[family]["mailboxes"].add(address)
+
+    rows = []
+    for family, item in families.items():
+        status = status_map.get(family) or {}
+        mails = mail_stats.get(family) or {}
+        mailboxes = sorted(item["mailboxes"])
+        mailbox_credentials = []
+        for address in mailboxes:
+            credential = credential_rows.get(address) or {}
+            mailbox_credentials.append({
+                "address": address,
+                "is_derived": address != family,
+                "credential_available": bool(credential),
+                "address_id": credential.get("id"),
+            })
+        base_credential = credential_rows.get(family) or {}
+        credential_count = sum(1 for entry in mailbox_credentials if entry["credential_available"])
+        rows.append({
+            "family": family,
+            "primary_email": family,
+            "mailboxes": mailboxes,
+            "mailbox_count": len(mailboxes),
+            "mailbox_credentials": mailbox_credentials,
+            "account_id": item["account_id"],
+            "account_name": item["account_name"],
+            "label": item["label"],
+            "source": item["source"],
+            "mail_count": int(mails.get("mail_count") or 0),
+            "latest_mail_at": mails.get("latest_mail_at") or "",
+            "openai_status": status.get("status") or "unknown",
+            "status_confidence": status.get("confidence") or "low",
+            "status_updated_at": status.get("latest_evidence_at") or "",
+            "status_evidence_ids": status.get("evidence_ids") or [],
+            "credential_available": credential_count > 0,
+            "credential_count": credential_count,
+            "address_id": base_credential.get("id"),
+        })
+    return rows, analysis
+
+def _agent_filter_account_pool(rows: list) -> list:
+    statuses = {x.strip().lower() for x in request.args.get("status", "").split(",") if x.strip()}
+    account_id = request.args.get("account_id", "").strip()
+    query = request.args.get("query", "").strip().lower()
+    has_mail = request.args.get("has_mail", "").strip().lower()
+    result = []
+    for row in rows:
+        if statuses and row["openai_status"] not in statuses:
+            continue
+        if account_id and row["account_id"] != account_id:
+            continue
+        if has_mail in ("1", "true", "yes") and row["mail_count"] <= 0:
+            continue
+        if has_mail in ("0", "false", "no") and row["mail_count"] > 0:
+            continue
+        if query and query not in " ".join([row["family"], *row["mailboxes"], row["label"], row["account_name"], row["account_id"]]).lower():
+            continue
+        result.append(row)
+    sort_by = request.args.get("sort", "family")
+    reverse = request.args.get("order", "asc").lower() == "desc"
+    key_map = {
+        "family": lambda x: x["family"],
+        "mail_count": lambda x: x["mail_count"],
+        "latest_mail_at": lambda x: x["latest_mail_at"],
+        "status": lambda x: x["openai_status"],
+        "account": lambda x: (x["account_name"], x["family"]),
+    }
+    result.sort(key=key_map.get(sort_by, key_map["family"]), reverse=reverse)
+    return result
+
+def _agent_mail_category(subject: str) -> str:
+    text = str(subject or "").lower()
+    if re.search(r"temporary chatgpt (?:login|verification) code|chatgpt.*(?:验证码|驗證碼|登录|登入)", text):
+        return "openai_login_code"
+    if "codex" in text and re.search(r"invite|invited|reminder|邀请|邀請|eingeladen", text):
+        return "codex_invitation"
+    if "new sign-in to your openai account" in text:
+        return "openai_sign_in"
+    if "multi-factor authentication settings have been changed" in text:
+        return "openai_mfa_change"
+    if "chatgpt" in text and re.search(r"new plan|plus|新计划|新計劃|kế hoạch", text):
+        return "openai_plus_subscription"
+    if "access deactivated" in text:
+        return "openai_deactivated"
+    if re.search(r"chatgpt|openai|codex", text):
+        return "openai_other"
+    if re.search(r"验证码|驗證碼|verification|login code|otp", text):
+        return "login_code_other"
+    return "other"
+
+def _agent_message_rows(force_status: bool = False, include_status: bool = False) -> tuple[list, dict]:
+    statuses = {x.strip().lower() for x in request.args.get("status", "").split(",") if x.strip()}
+    status_included = bool(force_status or include_status or statuses)
+    if status_included:
+        analysis, status_map = _agent_status_maps(force=force_status)
+    else:
+        analysis, status_map = {}, {}
+    family_accounts = {}
+    account_names = {a.get("id"): a.get("name") or a.get("real_email") or a.get("id") for a in _account_mgr.list_accounts()}
+    for record in _known_alias_records_for_inbound():
+        family = _base_plus_email(norm_email(record.get("email")))
+        if family and record.get("account_id"):
+            family_accounts[family] = str(record.get("account_id"))
+    with _inbound_store._lock, _inbound_store._connect() as conn:
+        raw_rows = [dict(r) for r in conn.execute(
+            """SELECT id,message_id,source_from AS sender,envelope_to,hme_alias,base_alias,
+                      account_id,subject,sender_name,created_at,
+                      LENGTH(COALESCE(text,'')) AS text_length,
+                      LENGTH(COALESCE(html,'')) AS html_length
+               FROM inbound_mails ORDER BY created_at DESC,id DESC"""
+        ).fetchall()]
+    mailbox = norm_email(request.args.get("mailbox") or request.args.get("family") or "")
+    mailbox_family = _base_plus_email(mailbox)
+    account_id = request.args.get("account_id", "").strip()
+    categories = {x.strip().lower() for x in request.args.get("category", "").split(",") if x.strip()}
+    query = request.args.get("query", "").strip().lower()
+    since = request.args.get("since", "").strip()
+    rows = []
+    for row in raw_rows:
+        family = norm_email(row.get("base_alias") or _base_plus_email(row.get("hme_alias")))
+        row["account_id"] = str(row.get("account_id") or family_accounts.get(family) or "")
+        row["account_name"] = account_names.get(row["account_id"], row["account_id"])
+        status = (status_map.get(family) or {}).get("status", "unknown")
+        category = _agent_mail_category(row.get("subject"))
+        if mailbox_family and family != mailbox_family:
+            continue
+        if account_id and str(row.get("account_id") or "") != account_id:
+            continue
+        if statuses and status not in statuses:
+            continue
+        if categories and category not in categories:
+            continue
+        if since and str(row.get("created_at") or "") < since:
+            continue
+        if query and query not in " ".join([str(row.get(k) or "") for k in ("subject", "sender", "hme_alias", "base_alias")]).lower():
+            continue
+        row["family"] = family
+        if status_included:
+            row["openai_status"] = status
+        row["category"] = category
+        rows.append(row)
+    analysis["status_included"] = status_included
+    return rows, analysis
+
 @app.route("/api/agent/bootstrap")
 def api_agent_bootstrap():
     response = jsonify(_agent_bootstrap_payload())
@@ -4295,6 +4548,152 @@ def api_agent_bootstrap():
 @app.route("/api/agent/openapi.json")
 def api_agent_openapi():
     response = jsonify(build_agent_openapi(_share_base_url()))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.route("/api/agent/account-pool")
+def api_agent_account_pool():
+    if _agent_bool(request.args.get("sync")):
+        _sync_cloud_alias_cache()
+    all_rows, analysis = _agent_account_pool_rows(force_status=_agent_bool(request.args.get("refresh_status")))
+    pool_status_counts = {}
+    for item in all_rows:
+        status = item["openai_status"]
+        pool_status_counts[status] = pool_status_counts.get(status, 0) + 1
+    rows = _agent_filter_account_pool(all_rows)
+    filtered_status_counts = {}
+    for item in rows:
+        status = item["openai_status"]
+        filtered_status_counts[status] = filtered_status_counts.get(status, 0) + 1
+    total = len(rows)
+    try:
+        limit, offset = _agent_pagination(default_limit=100, max_limit=500)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "invalid_pagination"}), 400
+    page = rows[offset:offset + limit]
+    response = jsonify({
+        "ok": True,
+        "pool_type": "hme_openai_family",
+        "results": page,
+        "count": total,
+        "family_count": total,
+        "mailbox_count": sum(item["mailbox_count"] for item in rows),
+        "limit": limit,
+        "offset": offset,
+        "returned": len(page),
+        "has_more": offset + len(page) < total,
+        "next_offset": offset + len(page) if offset + len(page) < total else None,
+        "status_counts": pool_status_counts,
+        "filtered_status_counts": filtered_status_counts,
+        "analysis_at": analysis.get("analysis_at"),
+        "analysis_cached": bool(analysis.get("cached")),
+        "analysis_cache_age_sec": int(analysis.get("cache_age_sec") or 0),
+        "analysis_stale": bool(analysis.get("stale")),
+        "status_warning": "OpenAI status is inferred from family-level email evidence, not an official account API.",
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.route("/api/agent/account-pool.csv")
+def api_agent_account_pool_csv():
+    if _agent_bool(request.args.get("sync")):
+        _sync_cloud_alias_cache()
+    rows, _ = _agent_account_pool_rows(force_status=_agent_bool(request.args.get("refresh_status")))
+    rows = _agent_filter_account_pool(rows)
+    out = io.StringIO()
+    fields = ["family", "primary_email", "account_id", "account_name", "label", "mail_count", "latest_mail_at", "openai_status", "status_confidence", "status_updated_at", "mailbox_count", "credential_available", "credential_count", "address_id", "mailboxes", "credential_addresses"]
+    writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        item = dict(row)
+        item["mailboxes"] = "|".join(row.get("mailboxes") or [])
+        item["credential_addresses"] = "|".join(
+            entry["address"] for entry in row.get("mailbox_credentials") or []
+            if entry.get("credential_available")
+        )
+        writer.writerow(item)
+    return Response("\ufeff" + out.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=icloud_hme_account_pool.csv", "Cache-Control": "no-store"})
+
+@app.route("/api/agent/account-pool/credentials", methods=["POST"])
+def api_agent_account_pool_credentials():
+    data = request.get_json(silent=True) or {}
+    requested = data.get("addresses") or data.get("families") or []
+    if not isinstance(requested, list) or not requested:
+        return jsonify({"ok": False, "error": "addresses must be a non-empty list"}), 400
+    if len(requested) > 100:
+        return jsonify({"ok": False, "error": "maximum 100 addresses per request"}), 400
+    pool_rows, _ = _agent_account_pool_rows(force_status=False)
+    known = account_pool_mailbox_index(pool_rows)
+    include_jwt = _agent_bool(data.get("include_jwt"), default=False)
+    results = []
+    for value in requested:
+        address = norm_email(value)
+        source = known.get(address)
+        if not source:
+            results.append({"address": address or str(value), "ok": False, "error": "address not found in HME account pool"})
+            continue
+        row = _cf_store.ensure_address(address, account_id=source.get("account_id", ""), label=source.get("label", ""), source="agent")
+        jwt = _cf_store.address_token(address_id=row["id"])
+        item = {"address": address, "family": source["family"], "address_id": row["id"], "ok": True, "login_url": f"{_share_base_url()}/?credential={jwt}"}
+        if include_jwt:
+            item["jwt"] = jwt
+        results.append(item)
+    response = jsonify({"ok": all(x.get("ok") for x in results), "results": results, "count": len(results), "sensitive": True})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.route("/api/agent/messages")
+def api_agent_messages():
+    rows, analysis = _agent_message_rows(
+        force_status=_agent_bool(request.args.get("refresh_status")),
+        include_status=_agent_bool(request.args.get("include_status")),
+    )
+    total = len(rows)
+    try:
+        limit, offset = _agent_pagination(default_limit=50, max_limit=200)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "invalid_pagination"}), 400
+    page = rows[offset:offset + limit]
+    response = jsonify({
+        "ok": True,
+        "results": page,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "returned": len(page),
+        "has_more": offset + len(page) < total,
+        "next_offset": offset + len(page) if offset + len(page) < total else None,
+        "analysis_at": analysis.get("analysis_at"),
+        "analysis_cached": bool(analysis.get("cached")),
+        "analysis_cache_age_sec": int(analysis.get("cache_age_sec") or 0),
+        "analysis_stale": bool(analysis.get("stale")),
+        "status_included": bool(analysis.get("status_included")),
+        "status_hint": "Add include_status=1 or a status filter to attach family-level OpenAI status.",
+        "available_categories": ["openai_login_code", "codex_invitation", "openai_sign_in", "openai_mfa_change", "openai_plus_subscription", "openai_deactivated", "openai_other", "login_code_other", "other"],
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@app.route("/api/agent/messages/<int:mail_id>")
+def api_agent_message(mail_id):
+    message = _inbound_store.get_message(mail_id)
+    if not message:
+        return jsonify({"ok": False, "error": "mail not found"}), 404
+    include_raw = _agent_bool(request.args.get("include_raw"))
+    include_headers = _agent_bool(request.args.get("include_headers"))
+    if not include_raw:
+        message.pop("raw", None)
+    if not include_headers:
+        message.pop("headers", None)
+        message.pop("headers_json", None)
+    family = norm_email(message.get("base_alias") or _base_plus_email(message.get("hme_alias")))
+    message["family"] = family
+    include_status = _agent_bool(request.args.get("include_status"))
+    if include_status:
+        _, status_map = _agent_status_maps(force=_agent_bool(request.args.get("refresh_status")))
+        message["openai_status"] = (status_map.get(family) or {}).get("status", "unknown")
+    message["category"] = _agent_mail_category(message.get("subject"))
+    response = jsonify({"ok": True, "message": message, "sensitive": True, "status_included": include_status})
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -4724,6 +5123,7 @@ def api_inbound_mail():
     try:
         known_aliases, account_map = _known_aliases_and_account_map()
         result = _inbound_store.ingest(payload, known_aliases=known_aliases, alias_account_map=account_map)
+        _invalidate_mail_analysis_cache()
         _emit_log("success", f"本机收信: {result.get('hme_alias') or '?'} ← {result.get('subject','')[:60]}")
         return jsonify({"ok":True, "mail": result})
     except Exception as e:

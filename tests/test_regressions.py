@@ -277,7 +277,8 @@ def test_agent_api_catalog_is_safe_and_complete():
     for required in (
         "accounts", "hme_create", "hme_delete", "inbox_messages",
         "mail_analysis", "account_forward_set", "scheduler_start",
-        "account_cookie", "skill_download",
+        "account_cookie", "skill_download", "agent_account_pool",
+        "agent_account_pool_credentials", "agent_messages",
     ):
         assert required in by_id
     assert by_id["hme_delete"]["confirmation_required"] is True
@@ -291,6 +292,36 @@ def test_agent_api_catalog_is_safe_and_complete():
     assert "ADMIN_TOKEN" not in encoded
     assert "cookie_input\": \"<USER_SUPPLIED_COOKIE>" in encoded
     print("  PASS test_agent_api_catalog_is_safe_and_complete")
+
+
+def test_agent_account_pool_credentials_preserve_plus_address():
+    """批量凭证必须为明确的 +1 地址签发，不能静默降级成 base 地址。"""
+    from agent_api import account_pool_mailbox_index, parse_agent_bool
+
+    family = {
+        "family": "demo@icloud.com",
+        "mailboxes": ["demo@icloud.com", "demo+1@icloud.com"],
+    }
+    known = account_pool_mailbox_index([family])
+    assert known["demo+1@icloud.com"] is family
+    assert "demo+2@icloud.com" not in known
+    assert parse_agent_bool("false") is False
+    assert parse_agent_bool("true") is True
+    print("  PASS test_agent_account_pool_credentials_preserve_plus_address")
+
+
+def test_agent_pagination_rejects_invalid_values():
+    """Agent 分页参数错误应返回结构化 400，而不是触发 500。"""
+    from agent_api import parse_agent_pagination
+
+    assert parse_agent_pagination(None, None, 100, 500) == (100, 0)
+    assert parse_agent_pagination("25", "50", 100, 500) == (25, 50)
+    try:
+        parse_agent_pagination("not-a-number", "0", 100, 500)
+        assert False, "invalid limit should fail"
+    except ValueError as exc:
+        assert "integers" in str(exc)
+    print("  PASS test_agent_pagination_rejects_invalid_values")
 
 
 def test_icloud_hme_skill_mail_analysis_heuristics():
@@ -332,6 +363,8 @@ if __name__ == "__main__":
         ("forward_setting_is_scoped_to_one_account", test_forward_setting_is_scoped_to_one_account),
         ("full_hme_account_does_not_call_apple_create", test_full_hme_account_does_not_call_apple_create),
         ("agent_api_catalog_is_safe_and_complete", test_agent_api_catalog_is_safe_and_complete),
+        ("agent_account_pool_credentials_preserve_plus_address", test_agent_account_pool_credentials_preserve_plus_address),
+        ("agent_pagination_rejects_invalid_values", test_agent_pagination_rejects_invalid_values),
         ("icloud_hme_skill_mail_analysis_heuristics", test_icloud_hme_skill_mail_analysis_heuristics),
     ]
     
