@@ -205,6 +205,12 @@ def confidence(status: str, text: str) -> str:
     return "low"
 
 
+def select_status_evidence(evidence: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Do not let a weak login-code signal overwrite Plus/deactivation evidence."""
+    strong = [item for item in evidence if item.get("status") in {"plus", "deactivated"}]
+    return strong[0] if strong else (evidence[0] if evidence else None)
+
+
 def analyze(base: str, token: str, page_size: int, max_details: int) -> Dict[str, Any]:
     messages = list_all_messages(base, token, page_size)
     known = list_known_addresses(base, token)
@@ -274,7 +280,7 @@ def analyze(base: str, token: str, page_size: int, max_details: int) -> Dict[str
     statuses = []
     for family, aliases in sorted(family_aliases.items()):
         evidence = sorted(evidence_by_family.get(family, []), key=lambda x: parse_time(x.get("created_at")), reverse=True)
-        latest = evidence[0] if evidence else None
+        latest = select_status_evidence(evidence)
         status = latest["status"] if latest else "unknown"
         note = "family-level evidence; +tag may have been removed upstream" if any("+" in a.split("@", 1)[0] for a in aliases) else ""
         for mailbox in sorted(aliases):

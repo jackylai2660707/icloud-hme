@@ -280,6 +280,11 @@ def test_icloud_hme_skill_mail_analysis_heuristics():
     assert module.detect_status("ChatGPT Plus subscription is active") == "plus"
     assert module.detect_status("OpenAI account has been deactivated") == "deactivated"
     assert module.detect_status("unrelated newsletter") is None
+    evidence = [
+        {"status": "free", "created_at": "2026-07-28T10:00:00Z"},
+        {"status": "plus", "created_at": "2026-07-27T10:00:00Z"},
+    ]
+    assert module.select_status_evidence(evidence)["status"] == "plus"
     print("  PASS test_icloud_hme_skill_mail_analysis_heuristics")
 
 

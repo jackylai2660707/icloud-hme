@@ -532,6 +532,11 @@ def _analysis_status(text: str):
         return "free", "medium"
     return None, "low"
 
+def _analysis_select_evidence(items: list):
+    """选择账号状态证据；弱登录码不能覆盖 Plus/停用等强证据。"""
+    strong = [item for item in items if item.get("status") in ("plus", "deactivated")]
+    return strong[0] if strong else (items[0] if items else None)
+
 def _build_mail_analysis(force: bool = False) -> dict:
     now = time.time()
     with _mail_analysis_cache_lock:
@@ -603,13 +608,16 @@ def _build_mail_analysis(force: bool = False) -> dict:
             families.setdefault(family, set()).update(item["alias"] for item in items if item.get("alias"))
 
         mailbox_status = []
+        family_status_counts = {}
         for family, aliases in sorted(families.items()):
             items = sorted(evidence.get(family, []), key=lambda x: (x.get("created_at") or "", x.get("id", 0)), reverse=True)
-            latest = items[0] if items else None
+            latest = _analysis_select_evidence(items)
+            family_status = latest["status"] if latest else "unknown"
+            family_status_counts[family_status] = family_status_counts.get(family_status, 0) + 1
             for mailbox in sorted(aliases):
                 mailbox_status.append({
                     "mailbox": mailbox, "family": family, "status_scope": "family",
-                    "status": latest["status"] if latest else "unknown",
+                    "status": family_status,
                     "confidence": latest["confidence"] if latest else "low",
                     "evidence_ids": [item["id"] for item in items[:10]],
                     "latest_evidence_at": latest.get("created_at", "") if latest else "",
@@ -624,7 +632,9 @@ def _build_mail_analysis(force: bool = False) -> dict:
             "ok": True, "analysis_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
             "messages_total": len(rows), "chatgpt_candidate_messages": chat_candidates,
             "categories": category_rows, "mailbox_status": mailbox_status,
-            "status_counts": status_counts, "cached": False, "cache_age_sec": 0,
+            "status_counts": status_counts,
+            "families_total": len(families), "family_status_counts": family_status_counts,
+            "cached": False, "cache_age_sec": 0,
             "warnings": [
                 "状态来自邮件内容启发式分析，不是 ChatGPT 官方订阅接口。",
                 "+tag 地址按 family 统计；上游去掉 +tag 时无法恢复精确归属。",
@@ -2473,8 +2483,8 @@ UI_HTML = r"""<!DOCTYPE html>
             (d.mailbox_status||[]).forEach(function(item){ mailStatusMap[String(item.mailbox||'').toLowerCase()] = item; });
             updateMailStatusFilter();
             if(E('mailAnalysisSummary')){
-                var c = d.status_counts||{};
-                E('mailAnalysisSummary').textContent = 'ChatGPT 状态: Free '+(c.free||0)+' / Plus '+(c.plus||0)+' / Deactivated '+(c.deactivated||0)+' / Unknown '+(c.unknown||0)+' · '+(d.messages_total||0)+' 封邮件 · '+(d.cached?'缓存 '+(d.cache_age_sec||0)+' 秒':'刚刚分析');
+                var c = d.family_status_counts||d.status_counts||{};
+                E('mailAnalysisSummary').textContent = 'ChatGPT family 状态: Free '+(c.free||0)+' / Plus '+(c.plus||0)+' / Deactivated '+(c.deactivated||0)+' / Unknown '+(c.unknown||0)+' · '+(d.families_total||0)+' 个 family · '+(d.messages_total||0)+' 封邮件 · '+(d.cached?'缓存 '+(d.cache_age_sec||0)+' 秒':'刚刚分析');
             }
             renderAliasTable();
             return true;

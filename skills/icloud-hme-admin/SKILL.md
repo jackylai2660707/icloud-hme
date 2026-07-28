@@ -46,7 +46,7 @@ x-admin-auth: $ICLOUD_HME_ADMIN_TOKEN
 - **计划任务**：先读 `/api/scheduler/config`，保存使用同一路径，启停分别使用 `/api/scheduler/start` 和 `/api/scheduler/stop`。停止后确认 `running=false`、`stopping=false`。
 - **HME 上限**：每个母号最多 `750` 个；`hme_full=true` 或 `alias_total>=750` 时禁止继续创建，调度器应跳过该母号但继续处理其它未满母号。
 - **日志**：`GET /api/logs` 只提取决定性错误；不要复制包含凭证或邮件内容的日志行。
-- **状态分析 API**：`GET /api/mail-analysis` 返回高频邮件类别、每个邮箱/family 的 ChatGPT 状态、证据 ID 和置信度；加 `refresh=1` 强制重新分析，默认缓存 5 分钟。
+- **状态分析 API**：`GET /api/mail-analysis` 返回高频邮件类别、每个邮箱/family 的 ChatGPT 状态、证据 ID 和置信度；加 `refresh=1` 强制重新分析，默认缓存 5 分钟。Plus/停用属于强证据，不会被后来收到的普通登录码覆盖；Free 仅表示存在登录/验证邮件且没有更强状态证据。
 
 ## `+tag` family 规则
 

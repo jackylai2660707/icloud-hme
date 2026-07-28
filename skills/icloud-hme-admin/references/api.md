@@ -50,6 +50,10 @@ For create/delete operations, confirm exact account/address and count first. `/a
 | GET | `/api/local-inbox/messages/{id}` | Full parsed message; fetch only when needed |
 | GET | `/api/mail-analysis` | Mail categories and per-mailbox ChatGPT status; cached for 5 minutes |
 | GET | `/api/mail-analysis?refresh=1` | Force a fresh local analysis |
+
+The response includes address-level `status_counts` and deduplicated
+`family_status_counts`. Plus/deactivation evidence takes precedence over weak login-code
+evidence; `free` remains a heuristic fallback rather than an authoritative plan lookup.
 | GET | `/api/inbound-config` | Worker config; contains sensitive inbound token, never print |
 | GET | `/api/logs` | Recent application logs; summarize only |
 
